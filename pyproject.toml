@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blind-ml"
+version = "0.1.0"
+description = "Train sklearn-style models on encrypted data via Blind Insight"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Blind Insight", email = "hello@blindinsight.com" }]
+keywords = ["machine-learning", "encryption", "privacy", "searchable-encryption", "blind-insight"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "scikit-learn>=1.0.0",
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "matplotlib>=3.4.0",
+    "requests>=2.25.0",
+    "cryptography>=41.0.0",
+]
+
+[project.optional-dependencies]
+notebooks = ["jupyter>=1.0.0", "notebook>=6.4.0"]
+dev = ["ruff>=0.6.0", "nbqa>=1.8.0"]
+
+[project.urls]
+Homepage = "https://blindinsight.com"
+Repository = "https://github.com/blind-insight/blind-ml"
+Documentation = "https://docs.blindinsight.io"
+Issues = "https://github.com/blind-insight/blind-ml/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["blind_ml"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["demo_data", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length handled by formatter
+    "E741",  # ambiguous variable names (l, I, O) — common in ML code
+    "B007",  # unused loop variables — common in iter unpacking; safe to leave
+    "B008",  # function calls in defaults — fine for pathlib.Path(...)
+    "B905",  # zip() without strict= — requires per-call review; revisit later
+    "W293",  # blank line whitespace inside multi-line string literals (HTML/JS)
+]
+
+[tool.ruff.format]
+quote-style = "double"

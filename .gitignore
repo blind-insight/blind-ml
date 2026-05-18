@@ -216,3 +216,41 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ───────────────────────────────────────────────────────────
+# blind-ml project-specific
+# ───────────────────────────────────────────────────────────
+
+# Environment variables (contains BI credentials)
+.env
+
+# Blind Proxy binary — download from https://docs.blindinsight.io
+blind
+
+# macOS
+.DS_Store
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Backups
+*.backup
+*_old*
+
+# Logs
+*.log
+
+# Generated exports
+*.pdf
+*.html
+
+# Generated demo data — regenerate with scripts/generate_*.py
+demo_data/plaintext/*.db
+demo_data/upload_batches/*.json
+
+# Allow the four sample batches we ship for first-run demos
+!demo_data/upload_batches/fraud_train_batch_01.json
+!demo_data/upload_batches/fraud_test_batch_01.json
+!demo_data/upload_batches/bc_train_batch_01.json
+!demo_data/upload_batches/bc_test_batch_01.json
+.ruff_cache/

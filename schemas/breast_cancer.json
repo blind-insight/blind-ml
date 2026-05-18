@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "required": [
+    "patient_id",
+    "age",
+    "age_group",
+    "age_at_menarche",
+    "menarche_category",
+    "age_at_first_birth",
+    "num_first_degree_relatives",
+    "family_history",
+    "num_prior_biopsies",
+    "has_prior_biopsy",
+    "atypical_hyperplasia",
+    "race_ethnicity",
+    "breast_density",
+    "cancer_5yr"
+  ],
+  "properties": {
+    "patient_id":                  { "type": "string" },
+    "age":                         { "type": "integer", "minimum": 40, "maximum": 76 },
+    "age_group":                   { "type": "string" },
+    "age_at_menarche":             { "type": "integer", "minimum": 8,  "maximum": 19 },
+    "menarche_category":           { "type": "string" },
+    "age_at_first_birth":          { "type": "integer", "minimum": 0,  "maximum": 47 },
+    "num_first_degree_relatives":  { "type": "integer", "minimum": 0,  "maximum": 5  },
+    "family_history":              { "type": "string" },
+    "num_prior_biopsies":          { "type": "integer", "minimum": 0,  "maximum": 7  },
+    "has_prior_biopsy":            { "type": "string" },
+    "atypical_hyperplasia":        { "type": "string" },
+    "race_ethnicity":              { "type": "string" },
+    "breast_density":              { "type": "integer", "minimum": 1,  "maximum": 6  },
+    "cancer_5yr":                  { "type": "integer", "minimum": 0,  "maximum": 3  }
+  }
+}

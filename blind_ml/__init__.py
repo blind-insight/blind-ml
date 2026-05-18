@@ -1,0 +1,33 @@
+"""blind_ml — train sklearn-style models on encrypted data via Blind Insight."""
+
+from .models import (
+    DecisionTreeModel,
+    LogisticRegressionModel,
+    NaiveBayesModel,
+    apply_platt,
+    build_design_matrix,
+    build_dummy_index,
+    build_marginals_local,
+    compute_pairwise_local,
+    entropy,
+    extract_marginals,
+    extract_pos_counts,
+    gini,
+    platt_scale,
+)
+
+__all__ = [
+    "NaiveBayesModel",
+    "DecisionTreeModel",
+    "LogisticRegressionModel",
+    "gini",
+    "entropy",
+    "build_marginals_local",
+    "extract_marginals",
+    "extract_pos_counts",
+    "compute_pairwise_local",
+    "build_dummy_index",
+    "build_design_matrix",
+    "platt_scale",
+    "apply_platt",
+]
