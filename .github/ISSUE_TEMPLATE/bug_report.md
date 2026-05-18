@@ -25,7 +25,7 @@ If the bug is in a notebook, please mention which cell number and paste the erro
 - Python version (`python3 --version`):
 - OS:
 - Blind Insight CLI version (`./blind --version`):
-- Did you regenerate data with `scripts/generate_*_data.py` or use the committed samples?
+- Did you regenerate data with `scripts/generate_*_data.py` or copy batches from [demo-datasets](https://github.com/blind-insight/demo-datasets)?
 
 ## Anything else?
 

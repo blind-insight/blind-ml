@@ -151,8 +151,10 @@ activemq-data/
 .env
 .envrc
 .venv
-env/
+.venv-*/
 venv/
+venv-*/
+env/
 ENV/
 env.bak/
 venv.bak/
@@ -244,13 +246,11 @@ blind
 *.pdf
 *.html
 
-# Generated demo data — regenerate with scripts/generate_*.py
+# Generated demo data — regenerate with scripts/generate_*.py or copy from demo-datasets
 demo_data/plaintext/*.db
-demo_data/upload_batches/*.json
+demo_data/upload_batches/*
+!demo_data/upload_batches/.gitkeep
 
-# Allow the four sample batches we ship for first-run demos
-!demo_data/upload_batches/fraud_train_batch_01.json
-!demo_data/upload_batches/fraud_test_batch_01.json
-!demo_data/upload_batches/bc_train_batch_01.json
-!demo_data/upload_batches/bc_test_batch_01.json
-.ruff_cache/
+# Local smoketest / scratch (scripts/smoke_test.py is tracked; its venv is not)
+.venv-smoke/
+venv-smoke/

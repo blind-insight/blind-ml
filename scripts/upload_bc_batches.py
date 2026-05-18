@@ -13,8 +13,10 @@ from pathlib import Path
 
 import requests
 
-# Load .env manually — no dotenv dependency required
-env_path = Path(__file__).parent / ".env"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Load .env from repo root — no dotenv dependency required
+env_path = REPO_ROOT / ".env"
 if env_path.exists():
     for line in env_path.read_text().splitlines():
         line = line.strip()
@@ -29,7 +31,8 @@ BATCH_DELAY = 120  # 2 minutes between batches (conservative — shaky server)
 POLL_EVERY = 10  # seconds between status polls
 LOCK_FILE = "/tmp/bi_bc_upload.lock"
 
-BATCHES = sorted(Path("demo_data/upload_batches").glob("bc_train_batch_*.json"))
+BATCH_DIR = REPO_ROOT / "demo_data" / "upload_batches"
+BATCHES = sorted(BATCH_DIR.glob("bc_train_batch_*.json"))
 
 # ── lockfile guard ────────────────────────────────────────────────────────────
 lock_fd = open(LOCK_FILE, "w")
@@ -37,6 +40,15 @@ try:
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
     print("ERROR: Another upload process is already running. Aborting.")
+    sys.exit(1)
+
+if not EMAIL or not PASSWORD:
+    print("ERROR: Set BI_EMAIL and BI_PASSWORD in .env (repo root).")
+    sys.exit(1)
+
+if not BATCHES:
+    print(f"ERROR: No bc_train_batch_*.json files in {BATCH_DIR}")
+    print("Run: python3 scripts/generate_healthcare_data.py")
     sys.exit(1)
 
 auth = (EMAIL, PASSWORD)

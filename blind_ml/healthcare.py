@@ -25,6 +25,7 @@ import pandas as pd
 from .demo_helpers import (
     _inject_notebook_styles,
     _inject_table_resize_script,
+    load_env,  # noqa: F401 — re-exported for breast_cancer.ipynb
     metrics_table,
 )
 from .models import (

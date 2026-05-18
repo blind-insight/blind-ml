@@ -1268,6 +1268,26 @@ def scaling_table(rows: list[dict[str, Any]]) -> str:
 # =============================================================================
 
 
+def get_fraud_demo_config() -> dict[str, Any]:
+    """Centralized notebook config for the fraud demo."""
+    return {
+        "dataset": "fraud-demo",
+        "schema": "train",
+        "test_schema": "test",
+        "sqlite_db": "demo_data/plaintext/fraud_train.db",
+        "test_sqlite_db": "demo_data/plaintext/fraud_test.db",
+        "features": [
+            "fraud_type",
+            "account_jurisdiction",
+            "is_active",
+            "month",
+            "reporting_bank_id",
+            "year",
+        ],
+        "target": "risk_level",
+    }
+
+
 def load_env(path: str = ".env"):
     """Load .env file into os.environ (no external deps)."""
     env_file = Path(path)

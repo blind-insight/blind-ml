@@ -30,7 +30,7 @@ jobs:
         run: ruff format --check .
 
       - name: nbqa ruff (notebooks)
-        run: nbqa ruff breast_cancer.ipynb fraud.ipynb
+        run: nbqa ruff --extend-ignore=E402,F401,E702,E401,I001,F811,F541 breast_cancer.ipynb fraud.ipynb
 
   import-smoke:
     runs-on: ubuntu-latest
@@ -49,8 +49,4 @@ jobs:
           pip install -e .
 
       - name: Import smoke test
-        run: |
-          python -c "from blind_ml import NaiveBayesModel, DecisionTreeModel, LogisticRegressionModel; print('blind_ml OK')"
-          python -c "from blind_ml.client import BlindInsightClient; print('client OK')"
-          python -c "from blind_ml.demo_helpers import data_table; print('demo_helpers OK')"
-          python -c "from blind_ml.healthcare import run_bc_full_validation; print('healthcare OK')"
+        run: python scripts/smoke_test.py

@@ -5,12 +5,9 @@ This client allows data scientists to query data from Blind Insight
 and use it in machine learning workflows with scikit-learn, pandas, etc.
 """
 
-import json
 import os
-import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -128,10 +125,10 @@ profiling = ProfilingStats()
 
 class BlindInsightClient:
     """
-    Client for querying data from Blind Insight via the backend API.
+    Client for querying data from Blind Insight via the Blind Proxy HTTP API.
 
     Example:
-        >>> client = BlindInsightClient(api_url="http://localhost:3001")
+        >>> client = BlindInsightClient(proxy_url="https://local.blindinsight.io")
         >>> data = client.query(
         ...     organization="my-org",
         ...     dataset_slug="iris-dataset",
@@ -145,37 +142,26 @@ class BlindInsightClient:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:3001",
-        backend: str | None = None,
-        proxy_url: str = "http://localhost:3002",
+        proxy_url: str = "https://local.blindinsight.io",
         proxy_auth: tuple | None = None,
         verify_ssl: bool = True,
     ):
         """
-        Initialize the Blind Insight client.
+        Initialize the Blind Insight client (proxy HTTP API).
 
         Args:
-            api_url: Base URL of the backend API (default: http://localhost:3001)
-            backend: "cli" to call the Blind CLI directly, "http" for /api/blind/query,
-                "proxy" for direct proxy API calls (fastest), or None to use BI_BACKEND
-                env var (defaults to "cli").
-            proxy_url: URL of the blind proxy (default: http://localhost:3002)
+            proxy_url: URL of the Blind Proxy (default: https://local.blindinsight.io)
             proxy_auth: Tuple of (email, password) for proxy auth, or None to use
-                BI_EMAIL and BI_PASSWORD env vars. Required for the proxy backend —
-                the proxy HTTP API authenticates each request independently of
-                ``./blind login``.
+                BI_EMAIL and BI_PASSWORD env vars. The proxy HTTP API authenticates
+                each request separately from ``./blind login``.
             verify_ssl: Whether to verify SSL certificates (default: True).
                 Set to False for local dev with self-signed certs.
         """
-        self.api_url = api_url.rstrip("/")
         self.proxy_url = proxy_url.rstrip("/")
         self.session = requests.Session()
         self.session.verify = verify_ssl
         self.profiling = profiling  # Use global profiling instance
-        self.backend = (backend or os.environ.get("BI_BACKEND") or "cli").lower()
-        self._blind_path = self._resolve_blind_path()
 
-        # Proxy auth (for "proxy" backend)
         if proxy_auth:
             self._proxy_auth = proxy_auth
         else:
@@ -183,96 +169,7 @@ class BlindInsightClient:
             password = os.environ.get("BI_PASSWORD")
             self._proxy_auth = (email, password) if email and password else None
 
-        # Schema ID cache for proxy backend (avoids repeated lookups)
         self._schema_id_cache: dict[str, str] = {}
-
-    def _resolve_blind_path(self) -> Path:
-        env_path = os.environ.get("BLIND_PATH")
-        if env_path:
-            return Path(env_path)
-        # Default: Look for blind CLI relative to this file.
-        # Set BLIND_PATH environment variable to point to your blind binary,
-        # e.g. BLIND_PATH=/usr/local/bin/blind
-        return Path(__file__).resolve().parent / "blind"
-
-    def _parse_cli_output(self, output: str) -> Any:
-        output = output.strip()
-        if not output:
-            return []
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            # Prefer the LAST JSON array in the output (CLI logs before JSON)
-            for idx in range(len(output) - 1, -1, -1):
-                if output[idx] != "[":
-                    continue
-                try:
-                    parsed, _ = decoder.raw_decode(output[idx:])
-                    return parsed
-                except json.JSONDecodeError:
-                    continue
-            # Fallback: prefer the last JSON object
-            for idx in range(len(output) - 1, -1, -1):
-                if output[idx] != "{":
-                    continue
-                try:
-                    parsed, _ = decoder.raw_decode(output[idx:])
-                    return parsed
-                except json.JSONDecodeError:
-                    continue
-            # Fallback: scan forward for any JSON (best-effort)
-            for idx, ch in enumerate(output):
-                if ch not in "[{":
-                    continue
-                try:
-                    parsed, _ = decoder.raw_decode(output[idx:])
-                    return parsed
-                except json.JSONDecodeError:
-                    continue
-        raise ValueError("Blind CLI did not return JSON. Check CLI output and auth.")
-
-    def _cli_record_list(
-        self,
-        organization: str,
-        dataset_slug: str,
-        schema_slug: str,
-        limit: int,
-        offset: int,
-        filters: list[str] | None,
-        decrypt: bool,
-    ) -> list[dict[str, Any]]:
-        blind_path = self._blind_path
-        if not blind_path.exists():
-            raise FileNotFoundError(f"Blind CLI not found at {blind_path}. Set BLIND_PATH.")
-
-        args = [
-            str(blind_path),
-            "record",
-            "list",
-            f"--organization={organization}",
-            f"--dataset={dataset_slug}",
-            f"--schema={schema_slug}",
-            f"--limit={limit}",
-            f"--offset={offset}",
-        ]
-        filter_str = ",".join(filters) if filters else ""
-        if filter_str:
-            args.extend(["--filter", filter_str])
-        if decrypt:
-            args.append("--decrypt")
-
-        proc = subprocess.run(args, capture_output=True, text=True)
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip()
-            raise ValueError(f"Blind CLI failed: {err}")
-
-        parsed = self._parse_cli_output(proc.stdout)
-        if isinstance(parsed, dict) and "records" in parsed:
-            return parsed.get("records", [])
-        if isinstance(parsed, list):
-            return parsed
-        return []
 
     def _get_proxy_auth(self):
         """Return HTTPBasicAuth for proxy requests, or raise with a clear message."""
@@ -329,9 +226,6 @@ class BlindInsightClient:
             preflight_filters: List of filter lists for count_only queries
                                (e.g. [["cancer_5yr:1"], ["cancer_5yr:1", "age_group:50_59"]])
         """
-        if self.backend != "proxy":
-            return  # Only needed for proxy backend
-
         if preflight_aggs is None and preflight_filters is None:
             preflight_aggs = [
                 "risk_level:count(0~100)",
@@ -553,94 +447,16 @@ class BlindInsightClient:
         Raises:
             requests.RequestException: If the API request fails
         """
-        if self.backend == "cli":
-            start_time = time.time()
-            records = self._cli_record_list(
-                organization=organization,
-                dataset_slug=dataset_slug,
-                schema_slug=schema_slug,
-                limit=limit,
-                offset=offset,
-                filters=filters,
-                decrypt=decrypt,
-            )
-            end_time = time.time()
-
-            if self.profiling.enabled:
-                filter_str = ",".join(filters) if filters else f"limit={limit}"
-                timing = QueryTiming(
-                    query_type="query",
-                    filter_str=filter_str,
-                    start_time=start_time,
-                    end_time=end_time,
-                    network_ms=(end_time - start_time) * 1000,
-                    parse_ms=0.0,
-                    total_ms=(end_time - start_time) * 1000,
-                    success=True,
-                    error=None,
-                )
-                self.profiling.record(timing)
-
-            return {
-                "success": True,
-                "count": len(records),
-                "records": records,
-                "encrypted": not decrypt,
-            }
-
-        # Proxy backend - direct API calls (fastest)
-        if self.backend == "proxy":
-            return self._proxy_query(
-                organization=organization,
-                dataset_slug=dataset_slug,
-                schema_slug=schema_slug,
-                limit=limit,
-                offset=offset,
-                filters=filters,
-                decrypt=decrypt,
-                count_only=count_only,
-            )
-
-        # HTTP backend - calls Blind Insight API
-        url = f"{self.api_url}/api/blind/query"
-
-        payload = {
-            "organization": organization,
-            "datasetSlug": dataset_slug,
-            "schemaSlug": schema_slug,
-            "limit": limit,
-            "offset": offset,
-            "filters": filters or [],
-            "decrypt": decrypt,
-        }
-
-        # Timing instrumentation (only when profiling enabled)
-        filter_str = ",".join(filters) if filters else f"limit={limit}"
-        start_time = time.time()
-
-        response = self.session.post(url, json=payload)
-        response.raise_for_status()
-        network_end = time.time()
-
-        result = response.json()
-        parse_end = time.time()
-
-        # Record timing if profiling is enabled
-        if self.profiling.enabled:
-            timing = QueryTiming(
-                query_type="query",
-                filter_str=filter_str,
-                start_time=start_time,
-                end_time=parse_end,
-                network_ms=(network_end - start_time) * 1000,
-                parse_ms=(parse_end - network_end) * 1000,
-                total_ms=(parse_end - start_time) * 1000,
-                success=True,
-                error=None,
-            )
-            self.profiling.record(timing)
-
-        return result
+        return self._proxy_query(
+            organization=organization,
+            dataset_slug=dataset_slug,
+            schema_slug=schema_slug,
+            limit=limit,
+            offset=offset,
+            filters=filters,
+            decrypt=decrypt,
+            count_only=count_only,
+        )
 
     def aggregate(
         self,
@@ -748,10 +564,8 @@ class BlindInsightClient:
         Returns:
             Dictionary with API status
         """
-        if self.backend == "cli":
-            raise NotImplementedError("Health check is not available in CLI mode.")
-        url = f"{self.api_url}/api/health"
-        response = self.session.get(url)
+        url = f"{self.proxy_url}/api/health/"
+        response = self.session.get(url, auth=self._get_proxy_auth())
         response.raise_for_status()
         return response.json()
 
@@ -760,7 +574,7 @@ def load_iris_from_blind(
     organization: str,
     dataset_slug: str,
     schema_slug: str,
-    api_url: str = "http://localhost:3001",
+    proxy_url: str = "https://local.blindinsight.io",
     filters: list[str] | None = None,
     decrypt: bool = True,  # Must be True for ML - scikit-learn needs plaintext
 ) -> tuple:
@@ -776,7 +590,7 @@ def load_iris_from_blind(
         organization: Blind Insight organization slug
         dataset_slug: Dataset slug containing the Iris data
         schema_slug: Schema slug containing the Iris data
-        api_url: Base URL of the backend API (default: http://localhost:3001)
+        proxy_url: Blind Proxy URL (default: https://local.blindinsight.io)
         filters: Optional list of encrypted filter strings (e.g., ["sepal-length:>5.0"])
         decrypt: Must be True for ML use (scikit-learn requires plaintext) - default: True
 
@@ -805,7 +619,7 @@ def load_iris_from_blind(
         >>> clf = LogisticRegression()
         >>> clf.fit(X, y)
     """
-    client = BlindInsightClient(api_url=api_url)
+    client = BlindInsightClient(proxy_url=proxy_url)
     df = client.load_data(organization, dataset_slug, schema_slug, limit=150, filters=filters, decrypt=decrypt)
 
     if df.empty:
@@ -864,7 +678,7 @@ def load_fraud_from_blind(
     organization: str,
     dataset_slug: str = "fraud-training",
     schema_slug: str = "fraud-training",
-    api_url: str = "http://localhost:3001",
+    proxy_url: str = "https://local.blindinsight.io",
     filters: list[str] | None = None,
     decrypt: bool = True,
     limit: int = 5000,
@@ -880,7 +694,7 @@ def load_fraud_from_blind(
         organization: Blind Insight organization slug
         dataset_slug: Dataset slug (default: fraud-training)
         schema_slug: Schema slug (default: fraud-training)
-        api_url: Backend API URL
+        proxy_url: Blind Proxy URL
         filters: Optional list of encrypted filter strings
         decrypt: Must remain True for ML (defaults to True)
         limit: Maximum rows to fetch for training
@@ -891,7 +705,7 @@ def load_fraud_from_blind(
         - feature_cols: list of columns to use as model features
         - target_col: the target column name ("is_fraud")
     """
-    client = BlindInsightClient(api_url=api_url)
+    client = BlindInsightClient(proxy_url=proxy_url)
     df = client.load_data(
         organization,
         dataset_slug,
@@ -921,7 +735,7 @@ def load_account_risk_from_blind(
     organization: str,
     dataset_slug: str = "account-info",
     schema_slug: str = "account-info",
-    api_url: str = "http://localhost:3001",
+    proxy_url: str = "https://local.blindinsight.io",
     filters: list[str] | None = None,
     decrypt: bool = True,
     limit: int = 5000,
@@ -938,7 +752,7 @@ def load_account_risk_from_blind(
         organization: Blind Insight organization slug
         dataset_slug: Dataset slug (default: account-info)
         schema_slug: Schema slug (default: account-info)
-        api_url: Backend API URL
+        proxy_url: Blind Proxy URL
         filters: Optional list of encrypted filter strings
         decrypt: Must remain True for ML (defaults to True)
         limit: Maximum rows to fetch for training
@@ -950,7 +764,7 @@ def load_account_risk_from_blind(
         - feature_cols: list of columns to use as model features
         - target_col: the target column name ("is_high_risk")
     """
-    client = BlindInsightClient(api_url=api_url)
+    client = BlindInsightClient(proxy_url=proxy_url)
     df = client.load_data(
         organization,
         dataset_slug,

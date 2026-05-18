@@ -27,7 +27,7 @@ Please give us a reasonable embargo window (typically 90 days from initial repor
 
 This policy covers:
 - Code in this repository (notebooks, the `blind_ml` package, scripts)
-- The demo data generators and sample datasets
+- The demo data generators (synthetic data only; upload batches live in [demo-datasets](https://github.com/blind-insight/demo-datasets))
 
 **Out of scope** (report to the respective project instead):
 - Vulnerabilities in the Blind Insight platform itself (CLI, proxy, server) — see [docs.blindinsight.io](https://docs.blindinsight.io) for the platform's disclosure address

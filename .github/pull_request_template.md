@@ -11,10 +11,11 @@
 
 ## How I tested
 
-<!-- Did you run the notebooks end-to-end? Against the committed samples or full-scale regenerated data? Anything reviewers should reproduce? -->
+<!-- Did you run the notebooks end-to-end? Sample batches from demo-datasets or full-scale generated data? Anything reviewers should reproduce? -->
 
 - [ ] Ran `ruff check .` and `ruff format --check .` — no errors
-- [ ] Ran the affected notebook(s) end-to-end on sample data
+- [ ] Ran the affected notebook(s) end-to-end (with local or demo-datasets sample data)
+- [ ] Cleared notebook outputs before push
 - [ ] Updated `README.md` and/or `APPROACH.md` if behavior or paths changed
 - [ ] No secrets, credentials, or internal infra references in the diff
 

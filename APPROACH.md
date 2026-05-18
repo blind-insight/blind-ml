@@ -428,9 +428,9 @@ These algorithms can be trained using binned statistics. For integer fields with
 
 ## Learn More
 
-- **Run the fraud demo** (NB + DT + LR on 600K records): Open `EncryptedFraudTraining.ipynb`
+- **Run the fraud demo** (NB + DT + LR): Open [`fraud.ipynb`](fraud.ipynb)
 - **Run the healthcare demo** (breast cancer risk prediction with HIPAA k=11): Open `BreastCancerRiskPrediction.ipynb`
-- **Read the code**: See `bi_demo_helpers.py` (fraud) and `healthcare_helpers.py` (healthcare) for the implementations
+- **Read the code**: See `blind_ml/demo_helpers.py` (fraud) and `blind_ml/healthcare.py` (healthcare) for the implementations
 - **Blind Insight Docs**: https://docs.blindinsight.io
 - **Key Sharing & Access Controls**: https://docs.blindinsight.io/getting-started/key-sharing/
 - **Fuzzy Matching on Encrypted Data (video)**: https://www.youtube.com/watch?v=ZMBVsJOwJ4k

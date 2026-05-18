@@ -20,7 +20,14 @@ cp .env.example .env                 # fill in your Blind Insight credentials
 
 You'll need a Blind Insight account to run the demos end-to-end. Sign up at [blindinsight.com](https://blindinsight.com); the proxy and CLI are downloadable from [docs.blindinsight.io](https://docs.blindinsight.io).
 
-The four sample batches in `demo_data/upload_batches/` are committed to the repo, so you can run the notebooks against a small dataset (50K fraud train + test, 20K BC train + 10K BC test) immediately after uploading them. For full-scale demos, regenerate the data with `python3 scripts/generate_fraud_data.py` and `python3 scripts/generate_healthcare_data.py`.
+### Demo data
+
+Upload batches and SQLite files are **not** in this repo (keeps clones small). Either:
+
+1. **Generate** — `python3 scripts/generate_fraud_data.py` and/or `python3 scripts/generate_healthcare_data.py`, or
+2. **Download** — copy JSON from [demo-datasets `datasets/blind-ml/`](https://github.com/blind-insight/demo-datasets/tree/main/datasets/blind-ml) into `demo_data/upload_batches/` (see [demo_data/README.md](demo_data/README.md)).
+
+Cursor users: see [.cursor/rules/cursor.md](.cursor/rules/cursor.md) and [.cursor/skills/blind-ml-demo/SKILL.md](.cursor/skills/blind-ml-demo/SKILL.md) for notebook and helper conventions.
 
 ## Linting and formatting
 
@@ -31,10 +38,20 @@ ruff check --fix .
 ruff format .
 ```
 
-For notebooks:
+For notebooks (same ignores as CI):
 
 ```bash
-nbqa ruff --fix breast_cancer.ipynb fraud.ipynb
+nbqa ruff --fix --extend-ignore=E402,F401,E702,E401,I001,F811,F541 breast_cancer.ipynb fraud.ipynb
+```
+
+```bash
+python3 scripts/smoke_test.py
+```
+
+Clear notebook outputs before pushing:
+
+```bash
+jupyter nbconvert --clear-output --inplace fraud.ipynb breast_cancer.ipynb
 ```
 
 ## Submitting a PR
@@ -49,7 +66,7 @@ External contributors cannot self-merge — every PR is reviewed and merged by a
 ## What we're especially looking for
 
 - **New algorithm demos** — pick any algorithm from the [supported list in APPROACH.md](APPROACH.md#what-algorithms-work-on-encrypted-data) and build a notebook
-- **New domains / use cases** — insurance fraud, identity verification, healthcare other than BC, etc.
+- **New domains / use cases** — insurance fraud, identity verification, healthcare beyond BC, etc.
 - **Performance work** — query batching, smarter caching, parallel execution patterns
 - **Docs** — clearer explanations, diagrams, runnable tutorials
 
