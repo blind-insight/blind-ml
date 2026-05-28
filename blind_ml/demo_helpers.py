@@ -732,9 +732,20 @@ def get_encrypted_count(client, org, dataset, schema, agg_filter: str, retries: 
 
 
 def discover_feature_values(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Return unique feature values from the local mirror, preserving the case
+    each field uses in BI's encrypted index.
+
+    The case must match how values were uploaded — BI's index does exact-match
+    on the hashed token, so a case mismatch returns zero records. For the
+    fraud demo: jurisdictions are uppercase ISO codes ("DE", "GB"...) on both
+    BI and local; fraud_types are naturally lowercase ("mule_account"). Down-
+    stream lookups in marginals/dummy_index/predict paths normalize case for
+    internal consistency, so the only place case matters is the BI query
+    wire format produced by ``_bi_queries``.
+    """
     return {
         "fraud_types": sorted(df["fraud_type"].astype(str).str.lower().unique().tolist()),
-        "jurisdictions": sorted(df["account_jurisdiction"].astype(str).str.lower().unique().tolist()),
+        "jurisdictions": sorted(df["account_jurisdiction"].astype(str).unique().tolist()),
         "active_values": sorted(df["is_active"].astype(str).str.lower().unique().tolist()),
         "month_values": sorted(df["month"].astype(str).unique().tolist(), key=lambda x: int(x)),
         "bank_ids": sorted(df["reporting_bank_id"].astype(str).unique().tolist()),
