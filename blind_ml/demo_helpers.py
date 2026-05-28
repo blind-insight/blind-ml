@@ -855,19 +855,63 @@ def run_bi_training(
     dataset: str,
     schema: str,
     values: dict[str, list[str]],
-    n_high: int = 0,
-    n_low: int = 0,
+    n_high_local: int | None = None,
+    n_low_local: int | None = None,
     batch_profile: str = "three_even",
     max_workers: int = 30,
 ) -> dict[str, object]:
     """Train Naive Bayes using encrypted aggregate queries only.
 
+    Class priors come from BI (via ``get_bi_base_rates``), not from local data.
+    Conditional counts come from ~90 encrypted aggregate queries against BI.
+
+    If ``n_high_local`` / ``n_low_local`` are supplied (computed from the local
+    SQLite mirror), they are printed alongside the BI base rates as a sanity
+    check — a large divergence indicates the mirror is out of sync with the
+    encrypted dataset.
+
     Uses ``max_workers`` threads spread across 3 balanced batches.
     Default 30 workers is tuned for a local BI server; callers targeting
     the hosted cloud instance should pass ``max_workers=10``.
     """
+    # Class priors from BI — this is the encrypted-data source of truth.
+    n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
     n_total = n_high + n_low
-    print(f"  Base rates (local): {n_total:,} records, high={n_high}, low={n_low}")
+
+    # Loud-fail smoke test. If BI returns 0 records, every conditional count
+    # below would also be 0, and Laplace smoothing would silently produce a
+    # uniform-conditional model that collapses to the prior. Don't let that
+    # happen quietly — surface the misconfiguration immediately.
+    if n_total == 0:
+        raise RuntimeError(
+            f"Blind Insight returned 0 base-rate records for "
+            f"{org}/{dataset}/{schema}. Training cannot proceed against an "
+            f"empty or unreachable dataset. Verify:\n"
+            f"  1. The Blind Proxy is running and authenticated "
+            f"(./blind users self).\n"
+            f"  2. Records have been ingested into this schema "
+            f"(./blind record list --organization {org} --dataset {dataset} "
+            f"--schema {schema} --limit 1).\n"
+            f"  3. BI_ORG / BI_DATASET / BI_SCHEMA in your .env match a "
+            f"populated dataset.\n"
+            f"  4. The schema declares risk_level as integer (string fields "
+            f"cannot be aggregated and will silently return 0).\n"
+            f"  5. Your user has query-key access to this schema."
+        )
+
+    print(f"  Base rates (BI):    {n_total:,} records, high={n_high:,}, low={n_low:,}")
+    if n_high_local is not None and n_low_local is not None:
+        n_total_local = n_high_local + n_low_local
+        print(f"  Base rates (local sanity): {n_total_local:,} records, high={n_high_local:,}, low={n_low_local:,}")
+        # Tolerance: 5% relative or 100 absolute, whichever is larger.
+        tol_high = max(100, int(0.05 * n_high))
+        tol_low = max(100, int(0.05 * n_low))
+        if abs(n_high - n_high_local) > tol_high or abs(n_low - n_low_local) > tol_low:
+            print(
+                "  WARNING: BI and local base rates differ by >5%. Local "
+                "mirror may be out of sync with the encrypted dataset, or "
+                "you may be pointing at different datasets."
+            )
 
     queries = _bi_queries(values)
     results: list[tuple] = []
@@ -1541,6 +1585,19 @@ def _fraud_row_features(row: dict) -> dict[str, str]:
     }
 
 
+# Maps the ``feat_type`` strings used in ``raw_results`` tuples (produced by
+# ``_bi_queries``) back to the actual DataFrame column names. Used by
+# ``run_encrypted_dt_fraud`` to feed BI counts into the tree's root split.
+_FRAUD_FEAT_TYPE_TO_COLUMN = {
+    "fraud": "fraud_type",
+    "jur": "account_jurisdiction",
+    "active": "is_active",
+    "month": "month",
+    "bank": "reporting_bank_id",
+    "year": "year",
+}
+
+
 def run_encrypted_dt_fraud(
     raw_results: list[tuple],
     feature_values: dict[str, list[str]],
@@ -1551,12 +1608,48 @@ def run_encrypted_dt_fraud(
     k_min: int = 0,
     criterion: str = "gini",
 ) -> dict[str, Any]:
-    """Build an encrypted decision tree for fraud using ml_core.DecisionTreeModel."""
+    """Build a decision tree whose ROOT split uses encrypted aggregate counts.
+
+    The root split is chosen from ``raw_results`` (encrypted BI marginal counts
+    returned by ``run_bi_training``) using only ``n_high`` / ``n_low`` from BI
+    base rates as the class totals. Deeper splits are computed from the local
+    plaintext mirror — see APPROACH.md, "root from BI marginals, deeper from
+    local cross-tabs." Zero additional BI queries beyond what NB already
+    fetched.
+    """
+    if not raw_results:
+        raise ValueError(
+            "run_encrypted_dt_fraud requires raw_results from run_bi_training. "
+            "Got an empty list — did NB training run? Pass bi['raw_results']."
+        )
+    if n_high + n_low == 0:
+        raise ValueError(
+            "run_encrypted_dt_fraud requires non-zero BI base rates. "
+            "Got n_high=n_low=0 — check that BI ingest completed."
+        )
+
     df = df_local.copy()
     df["is_high_risk"] = (df["risk_level"].astype(int) >= 50).astype(int)
 
+    # Case normalization: raw_results values come from `_bi_queries`, which
+    # mixes lowercased (fraud_type, jur, active) and original-case (bank_id,
+    # month, year) values. pd.get_dummies builds column names from the df's
+    # actual values. To make `f"{col}_{val}"` align on both sides, lowercase
+    # both the local df values AND the raw_results values uniformly.
+    for col in _FRAUD_FEATURES_ORDERED:
+        df[col] = df[col].astype(str).str.lower()
+    raw_results = [(ft, cls, str(val).lower(), cnt) for ft, cls, val, cnt in raw_results]
+
     dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
-    dt.fit(df, list(_FRAUD_FEATURE_MAP.keys()), "is_high_risk")
+    dt.fit_with_bi_root(
+        raw_results=raw_results,
+        feat_type_to_column=_FRAUD_FEAT_TYPE_TO_COLUMN,
+        df=df,
+        feature_columns=_FRAUD_FEATURES_ORDERED,
+        target_col="is_high_risk",
+        n_pos=n_high,
+        n_neg=n_low,
+    )
 
     return {
         "_model": dt,
@@ -1568,18 +1661,27 @@ def run_encrypted_dt_fraud(
         "train_time": dt.train_time,
         "criterion": criterion,
         "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
-        "root_gain": 0,
+        "root_gain": dt.tree.get("bi_root_gain", 0) if dt.tree else 0,
+        "root_from_bi": dt.tree.get("bi_root", False) if dt.tree else False,
         "root_children": {},
         "tree_nodes": {},
     }
 
 
 def fraud_dt_predict(dt_result: dict, row: dict) -> tuple[int, float]:
-    """Predict using the encrypted fraud decision tree. Returns (pred, risk)."""
+    """Predict using the encrypted fraud decision tree. Returns (pred, risk).
+
+    Row values for the fraud feature columns are lowercased to match the case
+    normalization applied at training time in ``run_encrypted_dt_fraud``.
+    """
     model = dt_result.get("_model")
-    if model:
-        return model.predict(row)
-    return 0, 0.0
+    if not model:
+        return 0, 0.0
+    row_normalized = dict(row)
+    for col in _FRAUD_FEATURES_ORDERED:
+        if col in row_normalized:
+            row_normalized[col] = str(row_normalized[col]).lower()
+    return model.predict(row_normalized)
 
 
 def train_plaintext_dt_fraud(

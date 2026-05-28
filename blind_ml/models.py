@@ -251,6 +251,179 @@ class DecisionTreeModel:
         self.train_time = time.time() - start
         return self
 
+    def fit_with_bi_root(
+        self,
+        raw_results: list[tuple[str, int, str, int]],
+        feat_type_to_column: dict[str, str],
+        df: pd.DataFrame,
+        feature_columns: list[str],
+        target_col: str,
+        n_pos: int,
+        n_neg: int,
+    ) -> DecisionTreeModel:
+        """Build a decision tree whose ROOT split is chosen from BI marginal counts.
+
+        The root one-hot dummy column is selected by computing Gini gain across
+        every (feature, value) pair in ``raw_results`` using only the encrypted
+        aggregate counts. Deeper splits are computed from the local DataFrame
+        mirror — see APPROACH.md, "root split from BI marginals, deeper splits
+        from local cross-tabs."
+
+        Parameters
+        ----------
+        raw_results : list of ``(feat_type, class_label, value, count)`` tuples
+            as returned by ``run_bi_training`` — the encrypted aggregate counts.
+        feat_type_to_column : maps the ``feat_type`` strings used in raw_results
+            (e.g. ``"fraud"``) to the actual DataFrame column names (e.g.
+            ``"fraud_type"``).
+        df : local plaintext mirror; used only for deeper splits.
+        feature_columns : feature columns to one-hot encode (in df).
+        target_col : binary 0/1 target column.
+        n_pos, n_neg : class totals from BI (``get_bi_base_rates``). The root
+            split's Gini gain is computed against these totals, not the local
+            DataFrame's class counts.
+        """
+        start = time.time()
+        self.feature_columns = list(feature_columns)
+
+        # One-hot encode the local mirror — same encoding ``fit`` uses so
+        # predict() and column names stay consistent.
+        X = df[feature_columns].copy()
+        for col in feature_columns:
+            X[col] = X[col].astype(str)
+        X_encoded = pd.get_dummies(X, columns=feature_columns, drop_first=False)
+        self.col_names = X_encoded.columns.tolist()
+        self._col_set = set(self.col_names)
+
+        y = df[target_col].values.astype(int)
+        X_arr = X_encoded.values.astype(np.float64)
+        imp_fn = gini if self.criterion == "gini" else entropy
+        _k = self.k_min
+        _md = self.max_depth
+
+        # ── Step 1: pick the ROOT split from BI marginal counts ────────────
+        # raw_results contains, for each (feat_type, class, value) triple, the
+        # encrypted aggregate count. Build a lookup: counts[col_name][class] = count.
+        # col_name follows pd.get_dummies' convention: f"{column}_{value}".
+        counts: dict[str, dict[int, int]] = {}
+        for feat_type, cls, val, count in raw_results:
+            col = feat_type_to_column.get(feat_type)
+            if col is None:
+                continue
+            col_name = f"{col}_{val}"
+            counts.setdefault(col_name, {0: 0, 1: 0})[int(cls)] = int(count)
+
+        base_imp_root = imp_fn(n_pos, n_neg)
+        best_gain_bi = 0.0
+        best_col_name: str | None = None
+        for col_name, by_class in counts.items():
+            if col_name not in self._col_set:
+                # raw_results references a value not present in local one-hot
+                # columns — skip rather than fabricate a split direction.
+                continue
+            left_pos = by_class.get(1, 0)
+            left_neg = by_class.get(0, 0)
+            left_n = left_pos + left_neg
+            right_pos = n_pos - left_pos
+            right_neg = n_neg - left_neg
+            right_n = right_pos + right_neg
+            if left_n == 0 or right_n == 0:
+                continue
+            if _k > 0 and (0 < left_pos < _k or 0 < right_pos < _k):
+                continue
+            n_total = left_n + right_n
+            wg = (left_n / n_total) * imp_fn(left_pos, left_neg) + (right_n / n_total) * imp_fn(right_pos, right_neg)
+            g = base_imp_root - wg
+            if g > best_gain_bi:
+                best_gain_bi = g
+                best_col_name = col_name
+
+        if best_col_name is None:
+            # No usable BI split — fall back to local fit so the demo still
+            # produces a tree, but flag it on the tree dict for transparency.
+            self.fit(df, feature_columns, target_col)
+            if self.tree is not None:
+                self.tree["bi_root"] = False
+            self.train_time = time.time() - start
+            return self
+
+        best_ci = self.col_names.index(best_col_name)
+
+        # ── Step 2: apply the BI-chosen split to the local data ────────────
+        all_indices = np.arange(len(df))
+        mask = X_arr[all_indices, best_ci] == 1
+
+        # ── Step 3: build child subtrees from local data (depths 1..max) ───
+        def _build(indices: np.ndarray, depth: int) -> dict:
+            n = len(indices)
+            n_pos_node = int(y[indices].sum())
+            n_neg_node = n - n_pos_node
+            risk = n_pos_node / max(1, n)
+            if depth >= _md or n == 0 or n_pos_node == 0 or n_neg_node == 0:
+                return {
+                    "type": "leaf",
+                    "risk": risk,
+                    "n_pos": n_pos_node,
+                    "n_neg": n_neg_node,
+                    "n": n,
+                }
+            base_imp = imp_fn(n_pos_node, n_neg_node)
+            best_gain, best_ci_child = 0.0, -1
+            y_sub = y[indices]
+            X_sub = X_arr[indices]
+            for ci in range(X_sub.shape[1]):
+                left_mask = X_sub[:, ci] == 1
+                left_n_c = int(left_mask.sum())
+                right_n_c = n - left_n_c
+                if left_n_c == 0 or right_n_c == 0:
+                    continue
+                left_pos_c = int((left_mask & (y_sub == 1)).sum())
+                right_pos_c = n_pos_node - left_pos_c
+                if _k > 0 and (0 < left_pos_c < _k or 0 < right_pos_c < _k):
+                    continue
+                wg_c = (left_n_c / n) * imp_fn(left_pos_c, left_n_c - left_pos_c) + (right_n_c / n) * imp_fn(
+                    right_pos_c, n_neg_node - (left_n_c - left_pos_c)
+                )
+                g_c = base_imp - wg_c
+                if g_c > best_gain:
+                    best_gain, best_ci_child = g_c, ci
+            if best_ci_child < 0:
+                return {
+                    "type": "leaf",
+                    "risk": risk,
+                    "n_pos": n_pos_node,
+                    "n_neg": n_neg_node,
+                    "n": n,
+                }
+            mask_c = X_arr[indices, best_ci_child] == 1
+            return {
+                "type": "split",
+                "col_idx": best_ci_child,
+                "col_name": self.col_names[best_ci_child],
+                "left": _build(indices[mask_c], depth + 1),
+                "right": _build(indices[~mask_c], depth + 1),
+                "n_pos": n_pos_node,
+                "n_neg": n_neg_node,
+                "n": n,
+            }
+
+        # Use BI base rates (n_pos, n_neg) on the root node's counts so the
+        # tree's reported totals reflect the encrypted dataset, not local.
+        self.tree = {
+            "type": "split",
+            "col_idx": best_ci,
+            "col_name": best_col_name,
+            "left": _build(all_indices[mask], 1),
+            "right": _build(all_indices[~mask], 1),
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "n": n_pos + n_neg,
+            "bi_root": True,
+            "bi_root_gain": best_gain_bi,
+        }
+        self.train_time = time.time() - start
+        return self
+
     def predict(self, row_dict: dict[str, Any]) -> tuple[int, float]:
         """Return (predicted_class, risk) for one row."""
         if not self.tree:
