@@ -33,10 +33,24 @@ See [APPROACH.md](../../APPROACH.md#what-algorithms-work-on-encrypted-data). Pre
 
 ## Common pitfalls
 
-- **Query syntax:** `field:count(50~100)` not `count(50, 100)`.
+- **Query syntax:** `field:count(50~100)` not `count(50, 100)`. Aggregates are filters in the BI API — see `./blind record list --filter "field:avg(0~100)"`.
 - **Warm-up:** call `client.warm_up(org, dataset, schema)` before heavy query loops.
 - **Scale:** fraud batches are 50K records each; BC batches 20K — upload as many as needed; SQLite generator can build full scale locally.
 - **Parity:** encrypted vs sklearn F1 gaps often mean schema bounds, indexing not finished (wait ~30s after upload), or plaintext/BI data mismatch — regenerate with the same script for both.
+- **Silent zero is fatal (E022):** if BI base rates are 0 or any feature's conditional counts are all 0, training will silently produce a uniform-conditional model that looks trained but isn't. Always call `get_bi_base_rates` first and raise loudly on 0. `run_bi_training` does this automatically — don't bypass it.
+- **Case sensitivity on the encrypted index (E023):** BI's encrypted index does case-sensitive exact-match on the hashed token. If your data is uploaded as `"DE"` (uppercase), a query for `"de"` returns 0 — silently. `discover_feature_values` must preserve the case BI uses; don't reflexively `.str.lower()` values. NB/DT survive casing bugs (averaging absorbs zeros); LR diverges catastrophically (`beta[0]` → -3M, all predictions collapse).
+- **Marginals mismatch is the fastest BI/local divergence diagnostic (E025):** when a model behaves differently on BI vs local counts, dump the (feature, value) → count pairs from both sides and print the top mismatches by absolute diff. Casing, partial uploads, and stale schemas jump out in 30 seconds.
+
+## Debugging a query-layer bug
+
+**Run the CLI against the live proxy first (E021).** Source-only diagnosis of the encrypted query layer (proxy ↔ server wire format, aggregate response, filter parsing) consistently produces confidently-wrong stories. The CLI is the canonical reference for both wire format and expected behavior:
+
+```bash
+./blind record list --organization <org> --dataset <dataset> --schema <schema> \
+  --filter "risk_level:count(50~100),fraud_type:mule_account"
+```
+
+Compare what the CLI returns to what the Python client returns. If they disagree, the bug is in the Python client. If they agree (e.g., both 0), the bug is environmental — wrong dataset, casing, upload failure, schema mismatch.
 
 ## Files to touch
 
