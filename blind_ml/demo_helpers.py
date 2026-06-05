@@ -10,7 +10,7 @@ import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
-from itertools import product
+from itertools import combinations, product
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,9 @@ from .models import (
 )
 from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
+)
+from .models import (
+    RandomForestModel as _RandomForestModel,
 )
 from .models import (
     build_bayesian_cpt_counts_local as _build_bayesian_cpt_counts_local,
@@ -1650,34 +1653,272 @@ _FRAUD_FEAT_TYPE_TO_COLUMN = {
 }
 
 
-def run_encrypted_dt_fraud(
-    raw_results: list[tuple],
+def _fraud_dt_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return DecisionTreeModel feature values keyed by fraud column name."""
+    values_by_feature: dict[str, list[str]] = {}
+    for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items():
+        seen: set[str] = set()
+        values_by_feature[feature] = []
+        for raw_value in feature_values.get(values_key, []):
+            value = str(raw_value).lower()
+            if value in seen:
+                continue
+            seen.add(value)
+            values_by_feature[feature].append(value)
+    return values_by_feature
+
+
+def _fraud_dt_wire_values(feature_values: dict[str, list[str]]) -> dict[str, dict[str, str]]:
+    """Map normalized DT values back to the exact BI token wire values."""
+    wire_values: dict[str, dict[str, str]] = {}
+    for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items():
+        wire_values[feature] = {}
+        for raw_value in feature_values.get(values_key, []):
+            wire_values[feature][str(raw_value).lower()] = str(raw_value)
+    return wire_values
+
+
+def _build_fraud_dt_count_provider(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
     feature_values: dict[str, list[str]],
-    df_local: pd.DataFrame,
-    n_high: int,
-    n_low: int,
+    raw_results: list[tuple] | None = None,
+    aggregate_cache: dict[str, int] | None = None,
+):
+    """Create a generic DecisionTreeModel count_fn backed by BI aggregates."""
+    dt_feature_values = _fraud_dt_feature_values(feature_values)
+    wire_values = _fraud_dt_wire_values(feature_values)
+    aggregate_cache = aggregate_cache if aggregate_cache is not None else {}
+    split_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+    query_counter = {"n": 0}
+
+    def _class_filter(cls: int) -> str:
+        return "risk_level:count(50~100)" if int(cls) == 1 else "risk_level:count(0~49)"
+
+    if raw_results:
+        for feat_type, cls, raw_value, count in raw_results:
+            feature = _FRAUD_FEAT_TYPE_TO_COLUMN.get(str(feat_type))
+            if feature is None:
+                continue
+            norm_value = str(raw_value).lower()
+            count = int(count)
+            key = (tuple(), feature, norm_value, int(cls))
+            split_cache[key] = count
+            field_name = _FRAUD_FEATURE_MAP[feature][1]
+            wire_value = wire_values.get(feature, {}).get(norm_value, str(raw_value))
+            aggregate_cache[f"{_class_filter(cls)},{field_name}:{wire_value}"] = count
+
+    def _aggregate(filters: list[str]) -> int:
+        query = ",".join(filters)
+        if query not in aggregate_cache:
+            aggregate_cache[query] = get_encrypted_count(client, org, dataset, schema, query)
+            query_counter["n"] += 1
+        return aggregate_cache[query]
+
+    def _allowed_values(path: tuple[tuple[str, str, bool], ...]) -> dict[str, set[str]]:
+        allowed = {feature: set(values) for feature, values in dt_feature_values.items()}
+        for feature, value, branch in path:
+            if feature not in allowed:
+                return {}
+            norm_value = str(value).lower()
+            if branch:
+                allowed[feature] &= {norm_value}
+            else:
+                allowed[feature].discard(norm_value)
+        return allowed
+
+    def _path_constraints(
+        path: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[dict[str, str], list[tuple[str, str]], bool]:
+        equalities: dict[str, str] = {}
+        exclusions: list[tuple[str, str]] = []
+        for feature, raw_value, branch in path:
+            value = str(raw_value).lower()
+            if value not in dt_feature_values.get(feature, []):
+                return {}, [], False
+            if branch:
+                existing = equalities.get(feature)
+                if existing is not None and existing != value:
+                    return {}, [], False
+                equalities[feature] = value
+            else:
+                exclusions.append((feature, value))
+
+        for feature, value in exclusions:
+            if equalities.get(feature) == value:
+                return {}, [], False
+        return equalities, exclusions, True
+
+    def _query_count(equalities: dict[str, str], class_label: int) -> int:
+        filters = [_class_filter(class_label)]
+        for feature in _FRAUD_FEATURES_ORDERED:
+            if feature not in equalities:
+                continue
+            field_name = _FRAUD_FEATURE_MAP[feature][1]
+            value = equalities[feature]
+            wire_value = wire_values.get(feature, {}).get(value, value)
+            filters.append(f"{field_name}:{wire_value}")
+        return _aggregate(filters)
+
+    def _count_with_exclusions(
+        equalities: dict[str, str],
+        exclusions: list[tuple[str, str]],
+        class_label: int,
+    ) -> int:
+        total = 0
+        n_exclusions = len(exclusions)
+        for size in range(n_exclusions + 1):
+            sign = -1 if size % 2 else 1
+            for subset in combinations(exclusions, size):
+                terms = dict(equalities)
+                impossible = False
+                for feature, value in subset:
+                    existing = terms.get(feature)
+                    if existing is not None and existing != value:
+                        impossible = True
+                        break
+                    terms[feature] = value
+                if impossible:
+                    continue
+                total += sign * _query_count(terms, class_label)
+        return max(0, total)
+
+    def count_fn(
+        path: tuple[tuple[str, str, bool], ...],
+        feature: str,
+        value: str,
+        class_label: int,
+    ) -> int:
+        norm_path = tuple((f, str(v).lower(), bool(branch)) for f, v, branch in path)
+        norm_value = str(value).lower()
+        key = (norm_path, feature, norm_value, int(class_label))
+        if key in split_cache:
+            return split_cache[key]
+
+        allowed = _allowed_values(norm_path + ((feature, norm_value, True),))
+        if not allowed or any(len(values) == 0 for values in allowed.values()):
+            split_cache[key] = 0
+            return 0
+
+        equalities, exclusions, possible = _path_constraints(norm_path + ((feature, norm_value, True),))
+        total = _count_with_exclusions(equalities, exclusions, class_label) if possible else 0
+        split_cache[key] = total
+        return total
+
+    return count_fn, lambda: query_counter["n"], dt_feature_values, aggregate_cache
+
+
+def run_encrypted_dt_fraud(
+    raw_results: list[tuple] | None = None,
+    feature_values: dict[str, list[str]] | None = None,
+    df_local: pd.DataFrame | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
     max_depth: int = 3,
     k_min: int = 0,
     criterion: str = "gini",
+    client=None,
+    org: str | None = None,
+    dataset: str | None = None,
+    schema: str | None = None,
+    max_workers: int = 10,
 ) -> dict[str, Any]:
-    """Build a decision tree whose ROOT split uses encrypted aggregate counts.
+    """Build a fraud decision tree from encrypted aggregate counts.
 
-    The root split is chosen from ``raw_results`` (encrypted BI marginal counts
-    returned by ``run_bi_training``) using only ``n_high`` / ``n_low`` from BI
-    base rates as the class totals. Deeper splits are computed from the local
-    plaintext mirror — see APPROACH.md, "root from BI marginals, deeper from
-    local cross-tabs." Zero additional BI queries beyond what NB already
-    fetched.
+    If ``client``/``org``/``dataset``/``schema`` are supplied, all splits are
+    trained from BI aggregate counts via ``DecisionTreeModel.fit_from_counts``.
+    Without those BI arguments, this preserves the older notebook behavior:
+    root split from ``raw_results`` and deeper splits from ``df_local``.
     """
-    if not raw_results:
+    if not feature_values:
+        raise ValueError("run_encrypted_dt_fraud requires feature_values.")
+
+    has_bi_context = client is not None and org and dataset and schema
+    raw_results_source = "provided"
+    base_rate_queries = 0
+
+    if has_bi_context:
+        if n_high is None or n_low is None:
+            n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+            base_rate_queries = 2
+        if raw_results is None:
+            queries = _bi_queries(feature_values)
+
+            def run_query(q):
+                f_type, r_class, val, q_str = q
+                count = get_encrypted_count(client, org, dataset, schema, q_str)
+                return (f_type, r_class, val, count)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                raw_results = list(executor.map(run_query, queries))
+            raw_results_source = "dt_rerun"
+    elif not raw_results:
         raise ValueError(
-            "run_encrypted_dt_fraud requires raw_results from run_bi_training. "
-            "Got an empty list — did NB training run? Pass bi['raw_results']."
+            "run_encrypted_dt_fraud needs either BI client/org/dataset/schema to fetch "
+            "Decision Tree counts or raw_results from a previous aggregate-count run."
         )
+
+    raw_results = raw_results or []
+    if n_high is None or n_low is None:
+        raise ValueError("run_encrypted_dt_fraud requires n_high and n_low base-rate counts from BI.")
     if n_high + n_low == 0:
         raise ValueError(
             "run_encrypted_dt_fraud requires non-zero BI base rates. "
             "Got n_high=n_low=0 — check that BI ingest completed."
+        )
+
+    if has_bi_context:
+        count_fn, query_count, dt_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+            client=client,
+            org=org,
+            dataset=dataset,
+            schema=schema,
+            feature_values=feature_values,
+            raw_results=raw_results,
+        )
+        dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
+        dt.fit_from_counts(
+            count_fn=count_fn,
+            feature_values=dt_feature_values,
+            n_pos=n_high,
+            n_neg=n_low,
+        )
+        if dt.tree is not None:
+            dt.tree["bi_counts"] = True
+
+        return {
+            "_model": dt,
+            "tree": dt.tree,
+            "col_names": dt.col_names,
+            "_col_set": dt._col_set,
+            "features": dt.feature_columns,
+            "feature_values": feature_values,
+            "train_time": dt.train_time,
+            "criterion": criterion,
+            "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
+            "root_gain": dt.tree.get("gain", 0) if dt.tree else 0,
+            "root_from_bi": True,
+            "counts_from_bi": True,
+            "local_fallback": False,
+            "enc_queries": len(raw_results) + query_count(),
+            "base_rate_queries": base_rate_queries,
+            "total_aggregate_calls": len(raw_results) + query_count() + base_rate_queries,
+            "raw_results_source": raw_results_source,
+            "additional_dt_queries": query_count(),
+            "raw_results": raw_results,
+            "query_cache": aggregate_cache,
+            "n_high": n_high,
+            "n_low": n_low,
+            "root_children": {},
+            "tree_nodes": {},
+        }
+
+    if df_local is None:
+        raise ValueError(
+            "run_encrypted_dt_fraud needs either BI client/org/dataset/schema for count-only "
+            "training or df_local for the legacy local deeper-split fallback."
         )
 
     df = df_local.copy()
@@ -1715,6 +1956,17 @@ def run_encrypted_dt_fraud(
         "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
         "root_gain": dt.tree.get("bi_root_gain", 0) if dt.tree else 0,
         "root_from_bi": dt.tree.get("bi_root", False) if dt.tree else False,
+        "counts_from_bi": False,
+        "local_fallback": True,
+        "enc_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "total_aggregate_calls": len(raw_results) + base_rate_queries,
+        "raw_results_source": raw_results_source,
+        "additional_dt_queries": 0,
+        "raw_results": raw_results,
+        "query_cache": {},
+        "n_high": n_high,
+        "n_low": n_low,
         "root_children": {},
         "tree_nodes": {},
     }
@@ -1734,6 +1986,31 @@ def fraud_dt_predict(dt_result: dict, row: dict) -> tuple[int, float]:
         if col in row_normalized:
             row_normalized[col] = str(row_normalized[col]).lower()
     return model.predict(row_normalized)
+
+
+def fraud_dt_describe(dt_result: dict) -> str:
+    """Return a readable text description of the fraud Decision Tree."""
+    model = dt_result.get("_model")
+    if not model or not model.tree:
+        return "Empty tree"
+
+    def _desc(node: dict, indent: int = 0) -> list[str]:
+        pre = "  " * indent
+        if node["type"] == "leaf":
+            return [
+                f"{pre}-> risk={node['risk']:.4f} "
+                f"(n={node['n']:,}, pos={node['n_pos']:,}, neg={node['n_neg']:,})"
+            ]
+
+        gain = node.get("gain", node.get("bi_root_gain", 0.0))
+        lines = [f"{pre}{node['col_name']}? gain={gain:.4f} (n={node['n']:,})"]
+        lines.append(f"{pre}  YES:")
+        lines.extend(_desc(node["left"], indent + 2))
+        lines.append(f"{pre}  NO:")
+        lines.extend(_desc(node["right"], indent + 2))
+        return lines
+
+    return "\n".join(_desc(model.tree))
 
 
 def train_plaintext_dt_fraud(
@@ -1782,6 +2059,216 @@ def fraud_plaintext_predict_proba(
     proba = model.predict_proba(X_encoded)
     pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
     return [float(p[pos_idx]) for p in proba]
+
+
+# =============================================================================
+# ENCRYPTED RANDOM FOREST (fraud)
+# =============================================================================
+
+
+def _run_fraud_marginal_queries(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    max_workers: int = 10,
+) -> list[tuple]:
+    """Fetch fraud class-split marginal counts from BI."""
+    queries = _bi_queries(feature_values)
+
+    def run_query(q):
+        f_type, r_class, val, q_str = q
+        count = get_encrypted_count(client, org, dataset, schema, q_str)
+        return (f_type, r_class, val, count)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(run_query, queries))
+
+
+def run_encrypted_rf_fraud(
+    feature_values: dict[str, list[str]] | None = None,
+    dt_result: dict | None = None,
+    raw_results: list[tuple] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    criterion: str = "gini",
+    k_min: int = 0,
+    random_state: int | None = 42,
+    client=None,
+    org: str | None = None,
+    dataset: str | None = None,
+    schema: str | None = None,
+    max_workers: int = 10,
+) -> dict[str, Any]:
+    """Train a fraud Random Forest from encrypted aggregate counts.
+
+    ``dt_result`` is optional. When provided, RF reuses its raw marginals,
+    base-rate counts, and aggregate query cache. When omitted, this helper
+    reruns the needed BI aggregate queries so the model cell can run alone.
+    """
+    if not feature_values:
+        if dt_result and dt_result.get("feature_values"):
+            feature_values = dt_result["feature_values"]
+        else:
+            raise ValueError("run_encrypted_rf_fraud requires feature_values or dt_result with feature_values.")
+
+    has_bi_context = client is not None and org and dataset and schema
+    if not has_bi_context:
+        raise ValueError("run_encrypted_rf_fraud requires BI client/org/dataset/schema.")
+
+    raw_results_source = "provided" if raw_results is not None else "rf_rerun"
+    base_rate_queries = 0
+    marginal_queries = 0
+    initial_cache: dict[str, int] = {}
+
+    if dt_result:
+        raw_results = raw_results if raw_results is not None else dt_result.get("raw_results")
+        n_high = n_high if n_high is not None else dt_result.get("n_high")
+        n_low = n_low if n_low is not None else dt_result.get("n_low")
+        initial_cache = dict(dt_result.get("query_cache", {}))
+        raw_results_source = "dt_result" if raw_results is not None else raw_results_source
+
+    if n_high is None or n_low is None:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        raw_results = _run_fraud_marginal_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            max_workers=max_workers,
+        )
+        marginal_queries = len(raw_results)
+        raw_results_source = "rf_rerun"
+
+    count_fn, query_count, rf_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        aggregate_cache=initial_cache,
+    )
+
+    model = _RandomForestModel(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        criterion=criterion,
+        k_min=k_min,
+        max_features=max_features,
+        random_state=random_state,
+    ).fit_from_counts(
+        count_fn=count_fn,
+        feature_values=rf_feature_values,
+        n_pos=n_high,
+        n_neg=n_low,
+    )
+
+    additional_rf_queries = query_count()
+    enc_queries = marginal_queries + additional_rf_queries
+    return {
+        "_model": model,
+        "trees": [tree.tree for tree in model.estimators_],
+        "feature_subsets": model.feature_subsets_,
+        "feature_values": feature_values,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "query_cache": aggregate_cache,
+        "counts_from_bi": True,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "max_features": max_features,
+        "criterion": criterion,
+        "train_time": model.train_time,
+        "enc_queries": enc_queries,
+        "base_rate_queries": base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "additional_rf_queries": additional_rf_queries,
+        "total_aggregate_calls": enc_queries + base_rate_queries,
+        "reused_cache_entries": len(initial_cache),
+    }
+
+
+def fraud_rf_predict(rf_result: dict, row: dict) -> tuple[int, float]:
+    """Predict using the encrypted fraud Random Forest."""
+    model = rf_result.get("_model")
+    if not model:
+        return 0, 0.0
+    row_normalized = dict(row)
+    for col in _FRAUD_FEATURES_ORDERED:
+        if col in row_normalized:
+            row_normalized[col] = str(row_normalized[col]).lower()
+    return model.predict(row_normalized)
+
+
+def fraud_rf_describe(rf_result: dict, max_trees: int = 3) -> str:
+    """Return a compact text description of the fraud Random Forest."""
+    model = rf_result.get("_model")
+    if not model or not model.estimators_:
+        return "Empty forest"
+
+    lines = [
+        f"Random Forest: {len(model.estimators_)} trees, "
+        f"max_depth={model.max_depth}, max_features={model.max_features}"
+    ]
+    for idx, (tree, subset) in enumerate(zip(model.estimators_[:max_trees], model.feature_subsets_[:max_trees]), 1):
+        lines.append(f"\nTree {idx} features: {', '.join(subset)}")
+        lines.append(fraud_dt_describe({"_model": tree}))
+    if len(model.estimators_) > max_trees:
+        lines.append(f"\n... {len(model.estimators_) - max_trees} more trees")
+    return "\n".join(lines)
+
+
+def train_plaintext_rf_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a sklearn RandomForestClassifier on fraud data."""
+    from sklearn.ensemble import RandomForestClassifier
+
+    start = time.time()
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    features = list(_FRAUD_FEATURE_MAP.keys())
+    X = df2[features].copy()
+    for col in features:
+        X[col] = X[col].astype(str)
+    X_encoded = pd.get_dummies(X, columns=features, drop_first=False)
+    col_names = X_encoded.columns.tolist()
+    y = df2["is_high_risk"]
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        max_features=max_features,
+        random_state=random_state,
+    )
+    model.fit(X_encoded, y)
+    return {"model": model, "col_names": col_names, "train_time": time.time() - start}
+
+
+def fraud_plaintext_rf_predict_proba(
+    model,
+    col_names: list[str],
+    df_test: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+) -> list[float]:
+    """Predict P(high_risk) using a trained sklearn RandomForestClassifier."""
+    return fraud_plaintext_predict_proba(model, col_names, df_test, feature_values)
 
 
 # =============================================================================

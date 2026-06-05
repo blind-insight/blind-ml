@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from itertools import product
 from typing import Any
 
@@ -642,6 +643,10 @@ class DecisionTreeModel:
         self.feature_columns: list[str] = []
         self.train_time: float = 0.0
 
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
     def fit(
         self,
         df: pd.DataFrame,
@@ -720,6 +725,137 @@ class DecisionTreeModel:
             }
 
         self.tree = _build(np.arange(len(df)), 0)
+        self.train_time = time.time() - start
+        return self
+
+    def fit_from_counts(
+        self,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
+        n_pos: int,
+        n_neg: int,
+    ) -> DecisionTreeModel:
+        """Build a binary CART tree from aggregate conditional counts.
+
+        Parameters
+        ----------
+        count_fn : callable
+            ``count_fn(path, feature_key, value, class_label)`` must return the
+            count of rows matching ``path`` AND ``feature_key == value`` AND the
+            binary class label. ``path`` is a tuple of
+            ``(feature_key, value, branch)`` entries where ``branch=True`` means
+            the previous split took the equality/left branch and
+            ``branch=False`` means it took the not-equal/right branch.
+        feature_values : {feature_key: [values]}
+            Candidate categorical values for one-hot CART splits.
+        n_pos, n_neg : class totals at the root node.
+        """
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+
+        self.feature_columns = list(feature_values.keys())
+        normalized_values: dict[str, list[str]] = {}
+        for feature, values in feature_values.items():
+            seen: set[str] = set()
+            normalized_values[feature] = []
+            for raw_value in values:
+                value = self._norm_value(raw_value)
+                if value in seen:
+                    continue
+                seen.add(value)
+                normalized_values[feature].append(value)
+
+        candidates: list[tuple[str, str, int, str]] = []
+        self.col_names = []
+        for feature in self.feature_columns:
+            for value in normalized_values[feature]:
+                col_name = f"{feature}_{value}"
+                col_idx = len(self.col_names)
+                self.col_names.append(col_name)
+                candidates.append((feature, value, col_idx, col_name))
+        self._col_set = set(self.col_names)
+
+        imp_fn = gini if self.criterion == "gini" else entropy
+        _k = self.k_min
+        _md = self.max_depth
+        count_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+
+        def _count(
+            path: tuple[tuple[str, str, bool], ...],
+            feature: str,
+            value: str,
+            cls: int,
+        ) -> int:
+            key = (path, feature, value, int(cls))
+            if key not in count_cache:
+                count_cache[key] = int(count_fn(path, feature, value, int(cls)))
+            return count_cache[key]
+
+        def _leaf(n_pos_node: int, n_neg_node: int) -> dict:
+            n = n_pos_node + n_neg_node
+            risk = n_pos_node / max(1, n)
+            return {"type": "leaf", "risk": risk, "n_pos": n_pos_node, "n_neg": n_neg_node, "n": n}
+
+        def _build(
+            path: tuple[tuple[str, str, bool], ...],
+            depth: int,
+            n_pos_node: int,
+            n_neg_node: int,
+        ) -> dict:
+            n = n_pos_node + n_neg_node
+            if depth >= _md or n == 0 or n_pos_node == 0 or n_neg_node == 0:
+                return _leaf(n_pos_node, n_neg_node)
+
+            base_imp = imp_fn(n_pos_node, n_neg_node)
+            best: tuple[float, str, str, int, str, int, int, int, int] | None = None
+
+            for feature, value, col_idx, col_name in candidates:
+                left_pos = _count(path, feature, value, 1)
+                left_neg = _count(path, feature, value, 0)
+                if left_pos < 0 or left_neg < 0:
+                    raise ValueError("count_fn returned a negative count")
+                if left_pos > n_pos_node or left_neg > n_neg_node:
+                    raise ValueError(
+                        "count_fn returned a split count larger than the current node total "
+                        f"for {feature}={value!r}"
+                    )
+
+                left_n = left_pos + left_neg
+                right_pos = n_pos_node - left_pos
+                right_neg = n_neg_node - left_neg
+                right_n = right_pos + right_neg
+                if left_n == 0 or right_n == 0:
+                    continue
+                if _k > 0 and (0 < left_pos < _k or 0 < right_pos < _k):
+                    continue
+
+                weighted_imp = (left_n / n) * imp_fn(left_pos, left_neg) + (right_n / n) * imp_fn(
+                    right_pos, right_neg
+                )
+                gain = base_imp - weighted_imp
+                if best is None or gain > best[0]:
+                    best = (gain, feature, value, col_idx, col_name, left_pos, left_neg, right_pos, right_neg)
+
+            if best is None or best[0] <= 0:
+                return _leaf(n_pos_node, n_neg_node)
+
+            _gain, feature, value, col_idx, col_name, left_pos, left_neg, right_pos, right_neg = best
+            left_path = path + ((feature, value, True),)
+            right_path = path + ((feature, value, False),)
+            return {
+                "type": "split",
+                "col_idx": col_idx,
+                "col_name": col_name,
+                "left": _build(left_path, depth + 1, left_pos, left_neg),
+                "right": _build(right_path, depth + 1, right_pos, right_neg),
+                "n_pos": n_pos_node,
+                "n_neg": n_neg_node,
+                "n": n,
+                "gain": best[0],
+            }
+
+        self.tree = _build(tuple(), 0, int(n_pos), int(n_neg))
         self.train_time = time.time() - start
         return self
 
@@ -903,9 +1039,13 @@ class DecisionTreeModel:
 
         active: set = set()
         for feat in self.feature_columns:
-            cname = f"{feat}_{row_dict.get(feat, '')}"
+            raw_value = row_dict.get(feat, "")
+            cname = f"{feat}_{raw_value}"
+            cname_norm = f"{feat}_{self._norm_value(raw_value)}"
             if cname in self._col_set:
                 active.add(cname)
+            elif cname_norm in self._col_set:
+                active.add(cname_norm)
 
         def _walk(node: dict) -> float:
             if node["type"] == "leaf":
@@ -914,6 +1054,133 @@ class DecisionTreeModel:
 
         risk = _walk(self.tree)
         return (1 if risk >= 0.5 else 0), risk
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RANDOM FOREST  (ensemble of aggregate-count decision trees)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RandomForestModel:
+    """Random forest over aggregate-count decision trees.
+
+    Each tree is a ``DecisionTreeModel`` trained through ``fit_from_counts`` on
+    a random subset of feature keys. This keeps the model generic: it depends on
+    a count provider, not on Blind Insight, DataFrames, or demo-specific fields.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        max_depth: int = 3,
+        criterion: str = "gini",
+        k_min: int = 0,
+        max_features: int | float | str | None = "sqrt",
+        random_state: int | None = None,
+        threshold: float = 0.5,
+    ) -> None:
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be >= 1")
+        self.n_estimators = int(n_estimators)
+        self.max_depth = max_depth
+        self.criterion = criterion
+        self.k_min = k_min
+        self.max_features = max_features
+        self.random_state = random_state
+        self.threshold = threshold
+        self.estimators_: list[DecisionTreeModel] = []
+        self.feature_subsets_: list[list[str]] = []
+        self.feature_columns: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def _resolve_max_features(self, n_features: int) -> int:
+        mf = self.max_features
+        if mf is None or mf == "all":
+            return n_features
+        if mf == "sqrt":
+            return max(1, int(math.ceil(math.sqrt(n_features))))
+        if mf == "log2":
+            return max(1, int(math.ceil(math.log2(max(2, n_features)))))
+        if isinstance(mf, float):
+            if not 0 < mf <= 1:
+                raise ValueError("float max_features must be in (0, 1]")
+            return max(1, int(math.ceil(mf * n_features)))
+        if isinstance(mf, int):
+            if mf < 1:
+                raise ValueError("integer max_features must be >= 1")
+            return min(mf, n_features)
+        raise ValueError("max_features must be None, 'all', 'sqrt', 'log2', int, or float")
+
+    def fit_from_counts(
+        self,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
+        n_pos: int,
+        n_neg: int,
+    ) -> RandomForestModel:
+        """Train an ensemble of count-backed decision trees.
+
+        Parameters match ``DecisionTreeModel.fit_from_counts``. Randomness only
+        controls feature-subset selection; all counts still come from the
+        supplied aggregate count function.
+        """
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+
+        self.feature_columns = list(feature_values.keys())
+        self.feature_values = {
+            feature: [self._norm_value(value) for value in values] for feature, values in feature_values.items()
+        }
+        n_features = len(self.feature_columns)
+        n_subset = self._resolve_max_features(n_features)
+        rng = np.random.default_rng(self.random_state)
+        self.estimators_ = []
+        self.feature_subsets_ = []
+
+        for i in range(self.n_estimators):
+            if i == 0 and n_subset < n_features:
+                # Include one full-view tree so the ensemble remains stable on
+                # sparse categorical demos where one feature may dominate.
+                subset = list(self.feature_columns)
+            elif n_subset >= n_features:
+                subset = list(self.feature_columns)
+                rng.shuffle(subset)
+            else:
+                subset = rng.choice(self.feature_columns, size=n_subset, replace=False).tolist()
+
+            subset_values = {feature: self.feature_values[feature] for feature in subset}
+            tree = DecisionTreeModel(
+                max_depth=self.max_depth,
+                criterion=self.criterion,
+                k_min=self.k_min,
+            ).fit_from_counts(
+                count_fn=count_fn,
+                feature_values=subset_values,
+                n_pos=n_pos,
+                n_neg=n_neg,
+            )
+            self.estimators_.append(tree)
+            self.feature_subsets_.append(subset)
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, mean_tree_risk)``."""
+        if not self.estimators_:
+            return 0, 0.0
+        risks = [tree.predict(row_features)[1] for tree in self.estimators_]
+        risk = float(sum(risks) / len(risks))
+        return (1 if risk >= self.threshold else 0), risk
 
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]

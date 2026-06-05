@@ -31,6 +31,12 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "fraud_plaintext_bn_predict_proba",
     "run_encrypted_dt_fraud",
     "fraud_dt_predict",
+    "fraud_dt_describe",
+    "run_encrypted_rf_fraud",
+    "fraud_rf_predict",
+    "fraud_rf_describe",
+    "train_plaintext_rf_fraud",
+    "fraud_plaintext_rf_predict_proba",
     "train_plaintext_dt_fraud",
     "fraud_plaintext_predict_proba",
     "fraud_model_summary_table",
@@ -107,6 +113,7 @@ def main() -> int:
                 "GaussianNaiveBayesModel",
                 "BayesianNetworkClassifierModel",
                 "HistogramClassifierModel",
+                "RandomForestModel",
             ],
         ),
     )
@@ -150,9 +157,11 @@ def main() -> int:
 
         from blind_ml import (
             BayesianNetworkClassifierModel,
+            DecisionTreeModel,
             GaussianNaiveBayesModel,
             HistogramClassifierModel,
             NaiveBayesModel,
+            RandomForestModel,
         )
 
         m = NaiveBayesModel()
@@ -202,8 +211,49 @@ def main() -> int:
         assert pred == 1
         assert risk > 0.5
 
+        rows = [
+            {"color": "red", "shape": "round", "y": 1},
+            {"color": "red", "shape": "square", "y": 1},
+            {"color": "blue", "shape": "round", "y": 0},
+            {"color": "blue", "shape": "square", "y": 0},
+        ]
 
-    check("NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()", model_smoke)
+        def count_fn(path, feature, value, cls):
+            total = 0
+            for row in rows:
+                if row["y"] != cls:
+                    continue
+                if any((str(row[f]).lower() == v) != branch for f, v, branch in path):
+                    continue
+                if str(row[feature]).lower() == value:
+                    total += 1
+            return total
+
+        dt = DecisionTreeModel(max_depth=2).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = dt.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
+
+        rf = RandomForestModel(n_estimators=3, max_depth=2, max_features="all", random_state=42).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = rf.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
+
+
+    check(
+        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel(), DecisionTreeModel(), RandomForestModel()",
+        model_smoke,
+    )
 
     print("\nAll checks passed.")
     return 0
