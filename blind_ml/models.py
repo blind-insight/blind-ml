@@ -937,7 +937,7 @@ class HistogramClassifierModel:
     def __init__(
         self,
         alpha: float = 1.0,
-        threshold: float = 0.5,
+        threshold: float | None = None,
         use_feature_weights: bool = True,
     ) -> None:
         self.alpha = alpha
@@ -1012,6 +1012,9 @@ class HistogramClassifierModel:
             else:
                 self.feature_weights[feature_key] = 1.0
 
+        if self.threshold is None:
+            self.threshold = self.P_pos
+
         self.train_time = time.time() - start
         return self
 
@@ -1029,7 +1032,8 @@ class HistogramClassifierModel:
             total_weight += weight
 
         risk = weighted_risk / total_weight if total_weight > 0 else self.P_pos
-        pred = 1 if risk >= self.threshold else 0
+        threshold = self.threshold if self.threshold is not None else self.P_pos
+        pred = 1 if risk >= threshold else 0
         return pred, risk
 
     def predict_class(self, row_features: dict[str, str]) -> int:

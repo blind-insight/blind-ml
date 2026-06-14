@@ -766,30 +766,6 @@ def discover_feature_values(df: pd.DataFrame) -> dict[str, list[str]]:
     }
 
 
-def _fraud_marginal_count_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, str]]:
-    """Build class-split marginal count queries shared by count-only models."""
-    queries = []
-    for ft in values["fraud_types"]:
-        queries.append(("fraud", 1, ft, f"risk_level:count(50~100),fraud_type:{ft}"))
-        queries.append(("fraud", 0, ft, f"risk_level:count(0~49),fraud_type:{ft}"))
-    for jur in values["jurisdictions"]:
-        queries.append(("jur", 1, jur, f"risk_level:count(50~100),account_jurisdiction:{jur.upper()}"))
-        queries.append(("jur", 0, jur, f"risk_level:count(0~49),account_jurisdiction:{jur.upper()}"))
-    for act in values["active_values"]:
-        queries.append(("active", 1, act, f"risk_level:count(50~100),is_active:{act.lower()}"))
-        queries.append(("active", 0, act, f"risk_level:count(0~49),is_active:{act.lower()}"))
-    for mon in values["month_values"]:
-        queries.append(("month", 1, mon, f"risk_level:count(50~100),month:{mon}"))
-        queries.append(("month", 0, mon, f"risk_level:count(0~49),month:{mon}"))
-    for bank in values["bank_ids"]:
-        queries.append(("bank", 1, bank, f"risk_level:count(50~100),reporting_bank_id:{bank}"))
-        queries.append(("bank", 0, bank, f"risk_level:count(0~49),reporting_bank_id:{bank}"))
-    for year in values["year_values"]:
-        queries.append(("year", 1, year, f"risk_level:count(50~100),year:{year}"))
-        queries.append(("year", 0, year, f"risk_level:count(0~49),year:{year}"))
-    return queries
-
-
 def _bi_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, str]]:
     queries = []
     for ft in values["fraud_types"]:
@@ -1107,7 +1083,8 @@ def train_plaintext_nb(df: pd.DataFrame, feature_values: dict[str, list[str]]):
     }
 
 
-def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
+def _naive_bayes_log_posteriors(P_high, P_low, P_tables, row) -> tuple[float, float]:
+    """Return unnormalized log posteriors (log P(high|x), log P(low|x)) for one row."""
     eps = 1e-10
     ft = str(row["fraud_type"]).lower()
     jur = str(row["account_jurisdiction"]).lower()
@@ -1133,7 +1110,20 @@ def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
     log_l += math.log(max(P_month[0].get(mon, 0.1), eps))
     log_l += math.log(max(P_bank[0].get(bank, 0.1), eps))
     log_l += math.log(max(P_year[0].get(year, 0.1), eps))
+    return log_h, log_l
 
+
+def naive_bayes_predict_proba(P_high, P_low, P_tables, row) -> float:
+    """Return P(high_risk | row) from Naive Bayes probability tables."""
+    log_h, log_l = _naive_bayes_log_posteriors(P_high, P_low, P_tables, row)
+    max_log = max(log_h, log_l)
+    num = math.exp(log_h - max_log)
+    den = num + math.exp(log_l - max_log)
+    return num / den if den > 0 else 0.5
+
+
+def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
+    log_h, log_l = _naive_bayes_log_posteriors(P_high, P_low, P_tables, row)
     return 1 if log_h > log_l else 0
 
 
@@ -2180,9 +2170,9 @@ def _fraud_bn_query_values(feature_values: dict[str, list[str]]) -> dict[str, li
 def _fraud_query_filter(feature: str, value: str) -> str:
     """Build a Blind Insight equality filter for one fraud feature value."""
     field_name = _FRAUD_FEATURE_MAP[feature][1]
-    if feature == "account_jurisdiction":
-        value = str(value).upper()
-    elif feature == "is_active":
+    # ``discover_feature_values`` preserves source case (see 96a09d7); only
+    # ``is_active`` needs canonicalization to match the stored booleans.
+    if feature == "is_active":
         value = str(value).lower()
     return f"{field_name}:{value}"
 
@@ -2383,7 +2373,7 @@ def run_encrypted_histogram_fraud(
     n_high: int | None = None,
     n_low: int | None = None,
     alpha: float = 1.0,
-    threshold: float = 0.5,
+    threshold: float | None = None,
     use_feature_weights: bool = True,
     max_workers: int = 30,
 ) -> dict[str, Any]:
@@ -2398,7 +2388,7 @@ def run_encrypted_histogram_fraud(
         n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
         base_rate_queries = 2
 
-    queries = _fraud_marginal_count_queries(feature_values)
+    queries = _bi_queries(feature_values)
     raw_results: list[tuple] = []
 
     def run_query(q):
@@ -2448,7 +2438,7 @@ def train_plaintext_histogram_fraud(
     df: pd.DataFrame,
     feature_values: dict[str, list[str]],
     alpha: float = 1.0,
-    threshold: float = 0.5,
+    threshold: float | None = None,
     use_feature_weights: bool = True,
 ) -> dict[str, Any]:
     """Train HistogramClassifierModel from local plaintext marginal counts."""
@@ -2488,57 +2478,149 @@ def fraud_histogram_predict(hist_result: dict, row: dict) -> tuple[int, float]:
 
 
 # =============================================================================
+# FRAUD MODEL EVALUATION METRICS
+# =============================================================================
+
+# Typical field fraud positive rate — used for prior-shift evaluation in the demo.
+FRAUD_PRODUCTION_PRIOR = 0.015
+
+
+def recalibrate_fraud_risk(cohort_risk: float, cohort_prev: float, pop_prev: float) -> float:
+    """Shift a cohort-calibrated risk score to a different population prior (Bayes' rule)."""
+    if cohort_risk <= 0 or cohort_prev <= 0 or pop_prev <= 0:
+        return 0.0
+    if cohort_risk >= 1:
+        return 1.0
+    odds = (cohort_risk / (1 - cohort_risk)) * (pop_prev / cohort_prev) * ((1 - cohort_prev) / (1 - pop_prev))
+    return odds / (1 + odds)
+
+
+def compute_fraud_metrics(
+    y_true,
+    scores,
+    threshold: float = 0.5,
+    cohort_prior: float | None = None,
+    production_prior: float = FRAUD_PRODUCTION_PRIOR,
+) -> dict[str, Any]:
+    """Evaluate fraud-model scores on a held-out test set.
+
+    Returns confusion-matrix metrics at ``threshold``, plus ROC-AUC / PR-AUC on the
+    demo cohort prior and F1@best after recalibrating scores to ``production_prior``.
+    """
+    from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+
+    y_true_arr = np.asarray(y_true, dtype=int)
+    scores_arr = np.asarray(scores, dtype=float)
+    n = len(y_true_arr)
+    if cohort_prior is None:
+        cohort_prior = float(y_true_arr.mean()) if n else 0.5
+
+    preds = (scores_arr >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_true_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_true_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_true_arr == 1)).sum())
+    tn = int(((preds == 0) & (y_true_arr == 0)).sum())
+    sens = tp / max(1, tp + fn)
+    spec = tn / max(1, tn + fp)
+    ppv = tp / max(1, tp + fp)
+    f1 = 2 * tp / max(1, 2 * tp + fp + fn)
+    flagged = (tp + fp) / max(1, n)
+    acc = (tp + tn) / max(1, n)
+
+    if len(np.unique(y_true_arr)) < 2:
+        roc_auc = float("nan")
+        pr_auc = float("nan")
+        f1_best = float("nan")
+        f1_prod_best = float("nan")
+    else:
+        roc_auc = float(roc_auc_score(y_true_arr, scores_arr))
+        pr_auc = float(average_precision_score(y_true_arr, scores_arr))
+        precisions, recalls, _ = precision_recall_curve(y_true_arr, scores_arr)
+        f1_curve = 2 * precisions * recalls / np.maximum(precisions + recalls, 1e-12)
+        f1_best = float(np.nanmax(f1_curve))
+
+        prod_scores = np.array([recalibrate_fraud_risk(float(s), cohort_prior, production_prior) for s in scores_arr])
+        prec_p, rec_p, _ = precision_recall_curve(y_true_arr, prod_scores)
+        f1_prod_curve = 2 * prec_p * rec_p / np.maximum(prec_p + rec_p, 1e-12)
+        f1_prod_best = float(np.nanmax(f1_prod_curve))
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "sens": sens,
+        "spec": spec,
+        "ppv": ppv,
+        "f1": f1,
+        "f1_best": f1_best,
+        "flagged": flagged,
+        "acc": acc,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "f1_prod_best": f1_prod_best,
+        "cohort_prior": cohort_prior,
+        "production_prior": production_prior,
+        "threshold": threshold,
+    }
+
+
+def _format_metric_delta(enc: float, plain: float, higher_better: bool = True, scale: float = 1.0) -> str:
+    d = (enc - plain) * scale
+    cls = "status-good" if (d >= 0) == higher_better else "status-bad"
+    if scale == 100:
+        return f"<td class='{cls}'>{d:+.1f}pp</td>"
+    return f"<td class='{cls}'>{d:+.3f}</td>"
+
+
+def _format_metric_value(value: float, pct: bool = False) -> str:
+    if value != value:  # NaN
+        return "—"
+    if pct:
+        return f"{value * 100:.1f}%"
+    return f"{value:.3f}"
+
+
+# =============================================================================
 # FRAUD MODEL SUMMARY TABLES
 # =============================================================================
 
 
 def fraud_model_summary_table(
     model_name: str,
-    enc_f1: float,
-    plain_f1: float,
-    enc_sens: float,
-    plain_sens: float,
-    enc_spec: float,
-    plain_spec: float,
-    enc_ppv: float,
-    plain_ppv: float,
-    enc_flagged: float,
-    plain_flagged: float,
+    enc_metrics: dict[str, Any],
+    plain_metrics: dict[str, Any],
     enc_train_time: float,
     plain_train_time: float,
     enc_queries: int = 0,
+    plain_label: str = "sklearn",
     **kwargs,
 ) -> str:
-    """Build a comparison table for a single fraud model (encrypted vs sklearn)."""
+    """Build a comparison table for a single fraud model (encrypted vs benchmark)."""
+    prod_pct = enc_metrics.get("production_prior", FRAUD_PRODUCTION_PRIOR) * 100
 
-    def _delta(enc, plain, higher_better=True):
-        d = enc - plain
-        pp = d * 100
-        cls = "status-good" if (d >= 0) == higher_better else "status-bad"
-        return f"<td class='{cls}'>{pp:+.1f}pp</td>"
+    def _row(label: str, enc_key: str, plain_key: str, pct: bool = False) -> str:
+        enc_val = enc_metrics.get(enc_key, float("nan"))
+        plain_val = plain_metrics.get(plain_key, float("nan"))
+        return (
+            f"<tr class='data-row'><td class='label-cell'>{label}</td>"
+            f"<td class='number-cell'>{_format_metric_value(plain_val, pct=pct)}</td>"
+            f"<td class='number-cell'>{_format_metric_value(enc_val, pct=pct)}</td>"
+            f"{_format_metric_delta(enc_val, plain_val)}</tr>"
+        )
 
     return f"""<table class="bi-metrics-table">
-<tr class="header-row"><th></th><th>sklearn</th><th>Blind Insight</th><th>Delta</th></tr>
-<tr class='data-row'><td class='label-cell'>F1 Score</td>
-    <td class='number-cell'>{plain_f1:.3f}</td>
-    <td class='number-cell'>{enc_f1:.3f}</td>
-    {_delta(enc_f1, plain_f1)}</tr>
-<tr class='data-row'><td class='label-cell'>Sensitivity</td>
-    <td class='number-cell'>{plain_sens * 100:.1f}%</td>
-    <td class='number-cell'>{enc_sens * 100:.1f}%</td>
-    {_delta(enc_sens, plain_sens)}</tr>
-<tr class='data-row'><td class='label-cell'>Specificity</td>
-    <td class='number-cell'>{plain_spec * 100:.1f}%</td>
-    <td class='number-cell'>{enc_spec * 100:.1f}%</td>
-    {_delta(enc_spec, plain_spec)}</tr>
-<tr class='data-row'><td class='label-cell'>PPV (precision)</td>
-    <td class='number-cell'>{plain_ppv * 100:.1f}%</td>
-    <td class='number-cell'>{enc_ppv * 100:.1f}%</td>
-    {_delta(enc_ppv, plain_ppv)}</tr>
-<tr class='data-row'><td class='label-cell'>Flagged High-Risk</td>
-    <td class='number-cell'>{plain_flagged * 100:.1f}%</td>
-    <td class='number-cell'>{enc_flagged * 100:.1f}%</td>
-    <td class='number-cell'>{(enc_flagged - plain_flagged) * 100:+.1f}pp</td></tr>
+<caption style="caption-side:top;text-align:left;font-weight:600;padding-bottom:4px;">{model_name}</caption>
+<tr class="header-row"><th></th><th>{plain_label}</th><th>Blind Insight</th><th>Delta</th></tr>
+{_row("F1 @0.5 (demo prior)", "f1", "f1")}
+{_row("F1@best (demo prior)", "f1_best", "f1_best")}
+{_row("ROC-AUC", "roc_auc", "roc_auc")}
+{_row("PR-AUC", "pr_auc", "pr_auc")}
+{_row(f"F1@best @ {prod_pct:.1f}% prod prior", "f1_prod_best", "f1_prod_best")}
+{_row("Sensitivity @0.5", "sens", "sens", pct=True)}
+{_row("Specificity @0.5", "spec", "spec", pct=True)}
+{_row("PPV (precision) @0.5", "ppv", "ppv", pct=True)}
+{_row("Flagged High-Risk @0.5", "flagged", "flagged", pct=True)}
 <tr class='data-row'><td class='label-cell'>Train Time</td>
     <td class='number-cell'>{plain_train_time * 1000:.0f}ms</td>
     <td class='number-cell'>{enc_train_time:.1f}s</td>
@@ -2551,37 +2633,38 @@ def fraud_model_summary_table(
 
 
 def fraud_three_model_table(models: list[dict[str, Any]]) -> str:
-    """Build a three-model comparison table for fraud (NB, DT, LR vs sklearn)."""
-    header = "<tr class='header-row'><th></th>"
+    """Build a multi-model comparison table (encrypted metrics on the demo test set)."""
+    header = "<tr class='header-row'><th>Metric</th>"
     for m in models:
         header += f"<th>{m['name']}</th>"
     header += "</tr>"
 
-    def _row(label, key, fmt=".3f"):
+    def _row(label: str, key: str, fmt: str = ".3f") -> str:
         cells = f"<td class='label-cell'>{label}</td>"
         for m in models:
-            v = m.get(key, 0)
-            if isinstance(v, float):
-                cells += f"<td class='number-cell'>{v:{fmt}}</td>"
-            else:
-                cells += f"<td class='number-cell'>{v}</td>"
+            metrics = m.get("enc_metrics", m)
+            v = metrics.get(key, float("nan"))
+            cells += (
+                f"<td class='number-cell'>{_format_metric_value(v)}</td>"
+                if fmt == ".3f"
+                else f"<td class='number-cell'>{v:{fmt}}</td>"
+            )
         return f"<tr class='data-row'>{cells}</tr>"
 
-    def _delta_row(label, enc_key, plain_key, fmt=".1f"):
-        cells = f"<td class='label-cell'>{label}</td>"
-        for m in models:
-            d = (m.get(enc_key, 0) - m.get(plain_key, 0)) * 100
-            cls = "status-good" if abs(d) < 1 else ("status-bad" if d < -1 else "number-cell")
-            cells += f"<td class='{cls}'>{d:+{fmt}}pp</td>"
-        return f"<tr class='data-row'>{cells}</tr>"
+    prod_pct = FRAUD_PRODUCTION_PRIOR * 100
+    if models:
+        first = models[0].get("enc_metrics", models[0])
+        if first.get("production_prior") is not None:
+            prod_pct = first["production_prior"] * 100
 
     rows = "\n".join(
         [
-            _row("Encrypted F1", "enc_f1"),
-            _row("sklearn F1", "plain_f1"),
-            _delta_row("F1 Gap", "enc_f1", "plain_f1"),
-            _row("Encrypted Accuracy", "enc_acc", ".1%"),
-            _row("sklearn Accuracy", "plain_acc", ".1%"),
+            _row("F1 @0.5", "f1"),
+            _row("F1@best", "f1_best"),
+            _row("ROC-AUC", "roc_auc"),
+            _row("PR-AUC", "pr_auc"),
+            _row(f"F1@best @ {prod_pct:.1f}% prod", "f1_prod_best"),
+            _row("Accuracy @0.5", "acc", ".1%"),
         ]
     )
 

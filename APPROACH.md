@@ -260,7 +260,7 @@ P(high_risk | x) ≈ Σ_j  w_j × risk(x_j) / Σ_j  w_j
 
 where `w_j` reflects feature discrimination (optional; enabled in the fraud demo).
 
-**The same ~90 aggregate queries that train Naive Bayes** also train the histogram classifier — only the post-aggregation math differs (averaged buckets vs multiplied conditionals). Re-run at full scale to confirm encrypted vs plaintext F1 match; the notebook at 500K train showed encrypted F1 0.884 vs plaintext histogram 0.789 on 50K test (worth validating if counts are bit-identical).
+**The same ~90 aggregate queries that train Naive Bayes** also train the histogram classifier — only the post-aggregation math differs (averaged buckets vs multiplied conditionals). Because both sides consume identical counts, encrypted and plaintext predictions are identical by construction (asserted by [`scripts/test_count_parity.py`](scripts/test_count_parity.py)). The histogram's decision threshold defaults to the **class prior**, not 0.5: its risk score is a weighted average of per-bucket posteriors, which is centered on the prior, so a fixed 0.5 threshold collapses to always-predict-high on skewed data.
 
 ---
 
@@ -418,16 +418,22 @@ For ML training, we specifically use aggregate queries (count, avg, sum) because
 
 ### All six models — encrypted vs benchmark
 
-| Model | Benchmark F1 | Encrypted F1 | Gap | BI Queries | Data Decrypted |
-|-------|-------------|-------------|-----|-----------|---------------|
-| **Naive Bayes** | 0.942 | 0.942 | 0pp | ~90 | Never |
-| **Decision Tree** (CART/Gini, depth 3) | 0.942 | 0.942 | 0pp | 0 (reuses NB) | Never |
-| **Logistic Regression** (OLS + IRLS) | 0.942 | 0.942 | 0pp | 0 (reuses NB) | Never |
-| **Gaussian Naive Bayes** | 0.789 | 0.789 | 0pp | ~96 | Never |
-| **Bayesian Network** | 1.000 | 1.000 | 0pp | ~514 | Never |
-| **Histogram Classifier** | 0.789 | 0.884 | +9.6pp | ~90 | Never |
+| Model | F1 @0.5 (demo) | ROC-AUC | PR-AUC | F1@best @1.5% prod prior | Encrypted vs plaintext | BI Queries | Data Decrypted |
+|-------|----------------|---------|--------|--------------------------|------------------------|-----------|---------------|
+| **Naive Bayes** | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | ~90 | Never |
+| **Decision Tree** (CART/Gini, depth 3) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
+| **Logistic Regression** (OLS + IRLS) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
+| **Gaussian Naive Bayes** | 0.789† | ~0.50 | see notebook | see notebook | 0pp by construction | ~96 | Never |
+| **Bayesian Network** | 1.000 | ~0.91 | see notebook | see notebook | 0pp by construction | ~514 | Never |
+| **Histogram Classifier** | 0.942‡ | ~0.91 | see notebook | see notebook | 0pp by construction | ~90 | Never |
 
-*NB, DT, LR: validated at ~600K train / ~54K test with realistic label noise (sklearn benchmarks). GNB, BN, Histogram: measured in [`fraud.ipynb`](fraud.ipynb) at 500K train / 50K test; query counts are fixed by feature cardinality, not row count. Histogram encrypted F1 exceeded plaintext histogram on that run — re-validate at full scale if counts must match bit-for-bit.*
+*All six are **count-only** models on a schema with **no k-anonymity**, so encrypted aggregate counts are byte-identical to plaintext: same counts ⇒ same parameters ⇒ same posteriors ⇒ same predictions, down to the bit. The encrypted-vs-plaintext gap is therefore **0pp by construction**, not a measured quantity — asserted by [`scripts/test_count_parity.py`](scripts/test_count_parity.py) rather than re-run per model. A non-zero gap means a data/pipeline mismatch (e.g. the encrypted dataset and the local mirror hold different rows), never encryption overhead.*
+
+*Benchmark F1 validated against sklearn: NB/DT/LR at ~600K train / ~54K test with realistic label noise; GNB/BN/Histogram in [`fraud.ipynb`](fraud.ipynb) at 500K train / 50K test. Query counts are fixed by feature cardinality, not row count.*
+
+*† Gaussian NB uses only date fields (`month`, `day`, `year`), which are independent of the label in the demo data → ROC-AUC ≈ 0.5, F1 = the majority-class baseline. It demonstrates count-derived Gaussian sufficient statistics, not fraud discrimination.*
+
+*‡ F1 at the tuned threshold. The histogram's risk score averages per-bucket posteriors and is centered on the class prior, so its threshold defaults to the class prior (not 0.5); at 0.5 on this ~65%-positive test set it collapses to always-predict-high (F1 = 0.789 = majority baseline). See "Evaluation under prior shift" below for ROC-AUC / PR-AUC at a production-realistic prior.*
 
 ### Training overhead
 
@@ -441,6 +447,14 @@ For ML training, we specifically use aggregate queries (count, avg, sum) because
 | **Histogram Classifier** | ~3.4s | ~22s (local BI, 500K train) | ~90 marginal queries (same as NB) |
 | **Data Exposure** | All records in plaintext | Zero records | - |
 | **Compliance** | Requires data access | GDPR / DORA / HIPAA safe | - |
+
+### Evaluation under prior shift
+
+The demo's headline F1 (0.942) is measured on a test set with the **same ~65% high-risk prior** as training. Real fraud is rare — a production fraud team sees on the order of a **1–2% positive rate**. F1 and PR-AUC are prior-sensitive: under prior-corrected posteriors at a ~1.5% prior, F1@best and PR-AUC for these models drop sharply, while **ROC-AUC is prior-invariant** (it ranks by score and is unaffected by the base rate). The takeaway:
+
+- **Report ROC-AUC and PR-AUC alongside F1.** ROC-AUC is the metric that survives deployment at a different prior; PR-AUC shows what precision/recall a team would actually trade off at the production prior.
+- **F1 at the balanced demo prior overstates field performance** for any rare-positive deployment. Treat the 0.942 as "discrimination on a balanced split", not "fraud-catch rate in production".
+- Numbers at the production prior should be populated from a full-scale re-validation (see the demo's metrics cells); they are intentionally **not** hard-coded here because they depend on the deployed prior.
 
 **There is no accuracy loss from encryption when counts match.** Aggregate counts from Blind Insight are mathematically identical to counts on plaintext, so NB, DT, LR, GNB, and BN learn the same parameters as their benchmarks (0pp F1 gap in validation). The F1 of **0.942** (not 1.000) for NB/DT/LR at ~600K reflects realistic label noise (~17% of training and ~8% of test records have fraud types that conflict with risk level). GNB uses only numeric date fields (`month`, `day`, `year`) and scores lower (F1≈0.789). BN achieves perfect separation on the 500K notebook split.
 
@@ -476,7 +490,7 @@ These algorithms have working implementations in [`fraud.ipynb`](fraud.ipynb) an
 | **Logistic Regression** | count | OLS from X'X and X'y (marginal + pairwise counts), refined via IRLS locally | ~600K train, F1=0.942 (matches sklearn LogisticRegression) |
 | **Gaussian Naive Bayes** | count | Per-value class counts on integer fields → sum/sum_sq → μ, σ² per class; sklearn-style variance smoothing | 500K train, F1=0.789 (matches sklearn `GaussianNB`, 0pp gap) |
 | **Bayesian Network** | count | CPT cells from multi-filter counts; DAG parent map (e.g. `year→month`, `jurisdiction→bank`) | 500K train, F1=1.000 (matches plaintext BN, 0pp gap) |
-| **Histogram Classifier** | count | Smoothed P(high\|feature=value) buckets; weighted average at predict time (no independence assumption) | 500K train; encrypted F1=0.884 vs plaintext histogram 0.789 on 50K test |
+| **Histogram Classifier** | count | Smoothed P(high\|feature=value) buckets; weighted average at predict time (no independence assumption); threshold defaults to class prior | 500K train; 0pp encrypted-vs-plaintext by construction (`test_count_parity`) |
 
 ### Native Support
 

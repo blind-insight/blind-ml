@@ -19,6 +19,9 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "run_bi_training",
     "train_plaintext_nb",
     "naive_bayes_predict",
+    "naive_bayes_predict_proba",
+    "compute_fraud_metrics",
+    "FRAUD_PRODUCTION_PRIOR",
     "data_table",
     "training_summary_table",
     "run_encrypted_gnb_fraud",
@@ -34,6 +37,9 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "train_plaintext_dt_fraud",
     "fraud_plaintext_predict_proba",
     "fraud_model_summary_table",
+    "compute_fraud_metrics",
+    "naive_bayes_predict_proba",
+    "FRAUD_PRODUCTION_PRIOR",
     "build_raw_results_local",
     "fraud_confusion_matrix_html",
     "compute_fraud_pairwise_local",
@@ -206,6 +212,18 @@ def main() -> int:
         "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()",
         model_smoke,
     )
+
+    def fraud_metrics_smoke():
+        from blind_ml.demo_helpers import compute_fraud_metrics, recalibrate_fraud_risk
+
+        y = [0, 0, 1, 1]
+        scores = [0.1, 0.4, 0.6, 0.9]
+        m = compute_fraud_metrics(y, scores, cohort_prior=0.5)
+        assert 0.9 < m["roc_auc"] <= 1.0
+        assert m["f1"] > 0
+        assert recalibrate_fraud_risk(0.65, 0.65, 0.015) < 0.65
+
+    check("compute_fraud_metrics()", fraud_metrics_smoke)
 
     print("\nAll checks passed.")
     return 0
