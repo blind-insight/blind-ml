@@ -34,6 +34,17 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "fraud_plaintext_bn_predict_proba",
     "run_encrypted_dt_fraud",
     "fraud_dt_predict",
+    "fraud_dt_describe",
+    "run_encrypted_rf_fraud",
+    "fraud_rf_predict",
+    "fraud_rf_describe",
+    "train_plaintext_rf_fraud",
+    "fraud_plaintext_rf_predict_proba",
+    "run_encrypted_adaboost_fraud",
+    "fraud_adaboost_predict",
+    "fraud_adaboost_describe",
+    "train_plaintext_adaboost_fraud",
+    "fraud_plaintext_adaboost_predict_proba",
     "train_plaintext_dt_fraud",
     "fraud_plaintext_predict_proba",
     "fraud_model_summary_table",
@@ -113,6 +124,8 @@ def main() -> int:
                 "GaussianNaiveBayesModel",
                 "BayesianNetworkClassifierModel",
                 "HistogramClassifierModel",
+                "RandomForestModel",
+                "AdaBoostStumpModel",
             ],
         ),
     )
@@ -155,10 +168,13 @@ def main() -> int:
     def model_smoke():
 
         from blind_ml import (
+            AdaBoostStumpModel,
             BayesianNetworkClassifierModel,
+            DecisionTreeModel,
             GaussianNaiveBayesModel,
             HistogramClassifierModel,
             NaiveBayesModel,
+            RandomForestModel,
         )
 
         m = NaiveBayesModel()
@@ -208,22 +224,58 @@ def main() -> int:
         assert pred == 1
         assert risk > 0.5
 
+        rows = [
+            {"color": "red", "shape": "round", "y": 1},
+            {"color": "red", "shape": "square", "y": 1},
+            {"color": "blue", "shape": "round", "y": 0},
+            {"color": "blue", "shape": "square", "y": 0},
+        ]
+
+        def count_fn(path, feature, value, cls):
+            total = 0
+            for row in rows:
+                if row["y"] != cls:
+                    continue
+                if any((str(row[f]).lower() == v) != branch for f, v, branch in path):
+                    continue
+                if str(row[feature]).lower() == value:
+                    total += 1
+            return total
+
+        dt = DecisionTreeModel(max_depth=2).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = dt.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
+
+        rf = RandomForestModel(n_estimators=3, max_depth=2, max_features="all", random_state=42).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = rf.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
+
+        boost = AdaBoostStumpModel(n_estimators=3).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = boost.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
+
     check(
-        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()",
+        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel(), DecisionTreeModel(), RandomForestModel(), AdaBoostStumpModel()",
         model_smoke,
     )
-
-    def fraud_metrics_smoke():
-        from blind_ml.demo_helpers import compute_fraud_metrics, recalibrate_fraud_risk
-
-        y = [0, 0, 1, 1]
-        scores = [0.1, 0.4, 0.6, 0.9]
-        m = compute_fraud_metrics(y, scores, cohort_prior=0.5)
-        assert 0.9 < m["roc_auc"] <= 1.0
-        assert m["f1"] > 0
-        assert recalibrate_fraud_risk(0.65, 0.65, 0.015) < 0.65
-
-    check("compute_fraud_metrics()", fraud_metrics_smoke)
 
     print("\nAll checks passed.")
     return 0

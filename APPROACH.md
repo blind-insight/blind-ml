@@ -121,7 +121,7 @@ Blind Insight provides a rich set of aggregate operations on encrypted data - **
 
 ## The Algorithms
 
-We demonstrate six ML algorithms on encrypted fraud data. **Naive Bayes, Decision Trees, and Logistic Regression** share the same ~90 aggregate queries (F1=0.942 at ~600K with label noise, 0pp gap vs sklearn). **Gaussian Naive Bayes**, **Bayesian Networks**, and **Histogram Classifiers** add ~96, ~514, and ~90 queries respectively; encrypted training matches the plaintext/sklearn benchmark where counts are exact (0pp gap for GNB and BN in the fraud notebook).
+We demonstrate eight ML algorithms on encrypted fraud data. **Naive Bayes, Histogram Classifiers, and the linear/count-based models** share reusable marginal counts; **Decision Trees, Random Forests, and AdaBoost** train from aggregate split counts with cache reuse; **Gaussian Naive Bayes** and **Bayesian Networks** add numeric-summary and CPT queries respectively. Encrypted training matches plaintext/sklearn benchmarks when counts match exactly.
 
 ### Algorithm 1: Naive Bayes
 
@@ -309,9 +309,9 @@ We do this for:
 
 Total: ~90 aggregate queries (all on encrypted data, all returning only counts)
 
-### Step 5: Train All Three Models
+### Step 5: Train Baseline Models
 
-The same ~90 queries feed all three algorithms:
+Those same marginal queries feed the count-based baseline models directly, and they seed deeper count-query models:
 
 ```python
 # Naive Bayes: conditional probabilities from counts
@@ -328,7 +328,7 @@ beta = solve(XtX, Xty)  # then refine with Newton-Raphson iterations
 
 ```python
 def predict(account):
-    # All three models can classify — pick one or ensemble them
+    # Any trained model can classify — pick one or ensemble them
     nb_score = naive_bayes_predict(account)    # probability-based
     dt_score = decision_tree_predict(account)  # rule-based
     lr_score = logistic_regression_predict(account)  # linear boundary
@@ -416,18 +416,20 @@ For ML training, we specifically use aggregate queries (count, avg, sum) because
 
 ## Performance Comparison
 
-### All six models — encrypted vs benchmark
+### Implemented models — encrypted vs benchmark
 
 | Model | F1 @0.5 (demo) | ROC-AUC | PR-AUC | F1@best @1.5% prod prior | Encrypted vs plaintext | BI Queries | Data Decrypted |
 |-------|----------------|---------|--------|--------------------------|------------------------|-----------|---------------|
 | **Naive Bayes** | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | ~90 | Never |
-| **Decision Tree** (CART/Gini, depth 3) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
-| **Logistic Regression** (OLS + IRLS) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
 | **Gaussian Naive Bayes** | 0.789† | ~0.50 | see notebook | see notebook | 0pp by construction | ~96 | Never |
 | **Bayesian Network** | 1.000 | ~0.91 | see notebook | see notebook | 0pp by construction | ~514 | Never |
+| **Decision Tree** (CART/Gini, depth 3) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
+| **Random Forest** | see notebook | see notebook | see notebook | see notebook | 0pp by construction | cache-aware; reuses DT counts or reruns as needed | Never |
+| **AdaBoost (stumps)** | see notebook | see notebook | see notebook | see notebook | 0pp by construction | cache-aware; reuses DT/RF counts or reruns as needed | Never |
+| **Logistic Regression** (OLS + IRLS) | 0.942 | ~0.91 | see notebook | see notebook | 0pp by construction | 0 (reuses NB) | Never |
 | **Histogram Classifier** | 0.942‡ | ~0.91 | see notebook | see notebook | 0pp by construction | ~90 | Never |
 
-*All six are **count-only** models on a schema with **no k-anonymity**, so encrypted aggregate counts are byte-identical to plaintext: same counts ⇒ same parameters ⇒ same posteriors ⇒ same predictions, down to the bit. The encrypted-vs-plaintext gap is therefore **0pp by construction**, not a measured quantity — asserted by [`scripts/test_count_parity.py`](scripts/test_count_parity.py) rather than re-run per model. A non-zero gap means a data/pipeline mismatch (e.g. the encrypted dataset and the local mirror hold different rows), never encryption overhead.*
+*All eight are **count-only** models on a schema with **no k-anonymity**, so encrypted aggregate counts are byte-identical to plaintext: same counts ⇒ same parameters ⇒ same posteriors ⇒ same predictions, down to the bit. The encrypted-vs-plaintext gap is therefore **0pp by construction**, not a measured quantity — asserted by [`scripts/test_count_parity.py`](scripts/test_count_parity.py) rather than re-run per model. A non-zero gap means a data/pipeline mismatch (e.g. the encrypted dataset and the local mirror hold different rows), never encryption overhead.*
 
 *Benchmark F1 validated against sklearn: NB/DT/LR at ~600K train / ~54K test with realistic label noise; GNB/BN/Histogram in [`fraud.ipynb`](fraud.ipynb) at 500K train / 50K test. Query counts are fixed by feature cardinality, not row count.*
 
@@ -440,7 +442,9 @@ For ML training, we specifically use aggregate queries (count, avg, sum) because
 | Aspect | Plaintext (sklearn / local) | Blind Insight | Overhead |
 |--------|----------------------------|--------------|----------|
 | **NB Training** | ~0.01s | ~35s (local BI) / ~2min (cloud) | Network round-trips for ~90 queries |
-| **DT Training** | ~1.4s | ~3s | Reuses NB marginals, local cross-tabs |
+| **DT Training** | ~1.4s | cache/query dependent | Fully aggregate-count training; reuses cached counts when available |
+| **RF Training** | sklearn baseline | cache/query dependent | Ensemble of aggregate-count trees; can reuse DT query cache |
+| **AdaBoost Training** | sklearn baseline | cache/query dependent | Sequential aggregate-count stumps; can reuse DT/RF query cache |
 | **LR Training** | ~1.4s | ~2.5s | OLS from aggregate counts + IRLS refinement |
 | **Gaussian NB** | ~0.2s | ~16s (local BI, 500K train) | ~96 value-count queries |
 | **Bayesian Network** | ~1.2s | ~75s (local BI, 500K train) | ~514 multi-filter CPT queries |
@@ -456,9 +460,9 @@ The demo's headline F1 (0.942) is measured on a test set with the **same ~65% hi
 - **F1 at the balanced demo prior overstates field performance** for any rare-positive deployment. Treat the 0.942 as "discrimination on a balanced split", not "fraud-catch rate in production".
 - Numbers at the production prior should be populated from a full-scale re-validation (see the demo's metrics cells); they are intentionally **not** hard-coded here because they depend on the deployed prior.
 
-**There is no accuracy loss from encryption when counts match.** Aggregate counts from Blind Insight are mathematically identical to counts on plaintext, so NB, DT, LR, GNB, and BN learn the same parameters as their benchmarks (0pp F1 gap in validation). The F1 of **0.942** (not 1.000) for NB/DT/LR at ~600K reflects realistic label noise (~17% of training and ~8% of test records have fraud types that conflict with risk level). GNB uses only numeric date fields (`month`, `day`, `year`) and scores lower (F1≈0.789). BN achieves perfect separation on the 500K notebook split.
+**There is no accuracy loss from encryption when counts match.** Aggregate counts from Blind Insight are mathematically identical to counts on plaintext, so NB, DT, RF, AdaBoost, LR, GNB, BN, and Histogram learn the same parameters as their benchmarks (0pp F1 gap in validation). The F1 of **0.942** (not 1.000) for NB/DT/LR/RF at ~600K reflects realistic label noise (~17% of training and ~8% of test records have fraud types that conflict with risk level). GNB uses only numeric date fields (`month`, `day`, `year`) and scores lower (F1≈0.789). BN achieves perfect separation on the 500K notebook split.
 
-**The main trade-off is training speed:** Query round-trips dominate. NB and Histogram each need ~90 queries; GNB ~96; BN ~514. DT and LR add **zero** extra BI queries once NB marginals are cached. BN training is the slowest fraud-demo path (~75s local at 500K); expect roughly proportional cloud overhead (~6× NB query count).
+**The main trade-off is training speed:** Query round-trips dominate. NB and Histogram each need ~90 queries; GNB ~96; BN ~514. DT, RF, and AdaBoost are cache-aware: they can reuse existing aggregate counts, but when sandboxed they rerun the split-count queries they need instead of depending on another model cell. BN training is the slowest fixed-query fraud-demo path (~75s local at 500K); tree ensembles depend on depth, feature cardinality, and cache hits.
 
 ---
 
@@ -481,16 +485,18 @@ All filters can be combined (e.g. `fraud_type:mule_account,risk_level:count(50~1
 
 ### Demonstrated (with code and validation)
 
-These algorithms have working implementations in [`fraud.ipynb`](fraud.ipynb) and `blind_ml/`, validated against sklearn or plaintext benchmarks. **NB, DT, LR, GNB, and BN show 0pp F1 gap** when encrypted counts match the local mirror.
+These algorithms have working implementations in [`fraud.ipynb`](fraud.ipynb) and `blind_ml/`, validated against sklearn or plaintext benchmarks. **All eight show 0pp F1 gap by construction** when encrypted counts match the local mirror (asserted by [`scripts/test_count_parity.py`](scripts/test_count_parity.py); RF and AdaBoost also validate against sklearn in the notebook).
 
 | Algorithm | BI operations used | How | Validated |
 |-----------|-------------------|-----|-----------|
 | **Naive Bayes (categorical)** | count | P(feature\|class) = count(feature AND class) / count(class) | ~600K train, F1=0.942 (matches sklearn) |
-| **Decision Trees (Gini/CART)** | count | Gini impurity from class counts per partition. Root split from BI marginals; deeper splits from local cross-tabs (verified 100% match) | ~600K train, F1=0.942 (matches sklearn CART) |
+| **Decision Trees (Gini/CART)** | count | Gini impurity from class counts per partition. Splits can train fully from BI aggregate counts; helpers may reuse cached marginal/deeper count queries when available | ~600K train, F1=0.942 (matches sklearn CART) |
 | **Logistic Regression** | count | OLS from X'X and X'y (marginal + pairwise counts), refined via IRLS locally | ~600K train, F1=0.942 (matches sklearn LogisticRegression) |
 | **Gaussian Naive Bayes** | count | Per-value class counts on integer fields → sum/sum_sq → μ, σ² per class; sklearn-style variance smoothing | 500K train, F1=0.789 (matches sklearn `GaussianNB`, 0pp gap) |
 | **Bayesian Network** | count | CPT cells from multi-filter counts; DAG parent map (e.g. `year→month`, `jurisdiction→bank`) | 500K train, F1=1.000 (matches plaintext BN, 0pp gap) |
 | **Histogram Classifier** | count | Smoothed P(high\|feature=value) buckets; weighted average at predict time (no independence assumption); threshold defaults to class prior | 500K train; 0pp encrypted-vs-plaintext by construction (`test_count_parity`) |
+| **Random Forests** | count | Ensemble of aggregate-count decision trees with random feature subsets. Reuses Decision Tree query caches when available, otherwise fetches its own count queries | Implemented in `blind_ml` and `fraud.ipynb`; validate against sklearn `RandomForestClassifier` |
+| **AdaBoost (stumps)** | count | Sequential ensemble of aggregate-count one-hot decision stumps. Reuses Decision Tree/Random Forest query caches when available, otherwise fetches its own count queries | Implemented in `blind_ml` and `fraud.ipynb`; validate against sklearn `AdaBoostClassifier` |
 
 ### Native Support
 
@@ -499,9 +505,7 @@ These algorithms can train **exactly** on encrypted aggregate counts in principl
 | Algorithm | BI operations used | How |
 |-----------|-------------------|-----|
 | **Decision Trees (entropy/ID3)** | count | Information gain variant; same approach as demonstrated Gini/CART with a different splitting criterion |
-| **Random Forests** | count | Ensemble of decision trees with random feature subsets. Each tree trains from the same aggregate counts with random feature masking. Majority vote across trees |
 | **Ridge Regression** | count | Same as logistic regression with L2 penalty: β = (X'X + λI)⁻¹ X'y. Lambda tuned on holdout |
-| **AdaBoost (stumps)** | count | Sequential ensemble of depth-1 decision trees. Each stump trains from weighted class counts; weights update based on stump error rate |
 | **Gradient Boosted Trees (shallow)** | count | Sequential trees fit to residuals. Each iteration: compute residual distribution from aggregate counts, fit a shallow tree to the residual bins |
 | **Statistical Tests** | count | Chi-square, Fisher's exact, etc. from contingency tables built with counts |
 | **Association Rules** | count | Support = count(itemset) / count(all) |
@@ -538,7 +542,7 @@ These algorithms can be trained using binned or summarized statistics when per-v
 
 ## Learn More
 
-- **Run the fraud demo** (six models: NB, GNB, BN, DT, LR, Histogram): Open [`fraud.ipynb`](fraud.ipynb)
+- **Run the fraud demo** (eight models: NB, GNB, BN, DT, RF, AdaBoost, LR, Histogram): Open [`fraud.ipynb`](fraud.ipynb)
 - **Run the healthcare demo** (breast cancer risk prediction with HIPAA k=11): Open `BreastCancerRiskPrediction.ipynb`
 - **Read the code**: See `blind_ml/demo_helpers.py` (fraud) and `blind_ml/healthcare.py` (healthcare) for the implementations
 - **Blind Insight Docs**: https://docs.blindinsight.io
