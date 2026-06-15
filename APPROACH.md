@@ -121,7 +121,7 @@ Blind Insight provides a rich set of aggregate operations on encrypted data - **
 
 ## The Algorithms
 
-We demonstrate seven ML algorithms on encrypted fraud data. **Naive Bayes, Histogram Classifiers, and the linear/count-based models** share reusable marginal counts; **Decision Trees and Random Forests** train from aggregate split counts with cache reuse; **Gaussian Naive Bayes** and **Bayesian Networks** add numeric-summary and CPT queries respectively. Encrypted training matches plaintext/sklearn benchmarks when counts match exactly.
+We demonstrate eight ML algorithms on encrypted fraud data. **Naive Bayes, Histogram Classifiers, and the linear/count-based models** share reusable marginal counts; **Decision Trees, Random Forests, and AdaBoost** train from aggregate split counts with cache reuse; **Gaussian Naive Bayes** and **Bayesian Networks** add numeric-summary and CPT queries respectively. Encrypted training matches plaintext/sklearn benchmarks when counts match exactly.
 
 ### Algorithm 1: Naive Bayes
 
@@ -309,9 +309,9 @@ We do this for:
 
 Total: ~90 aggregate queries (all on encrypted data, all returning only counts)
 
-### Step 5: Train All Three Models
+### Step 5: Train Baseline Models
 
-The same ~90 queries feed all three algorithms:
+Those same marginal queries feed the count-based baseline models directly, and they seed deeper count-query models:
 
 ```python
 # Naive Bayes: conditional probabilities from counts
@@ -328,7 +328,7 @@ beta = solve(XtX, Xty)  # then refine with Newton-Raphson iterations
 
 ```python
 def predict(account):
-    # All three models can classify — pick one or ensemble them
+    # Any trained model can classify — pick one or ensemble them
     nb_score = naive_bayes_predict(account)    # probability-based
     dt_score = decision_tree_predict(account)  # rule-based
     lr_score = logistic_regression_predict(account)  # linear boundary
@@ -480,6 +480,7 @@ These algorithms have working implementations in [`fraud.ipynb`](fraud.ipynb) an
 | **Bayesian Network** | count | CPT cells from multi-filter counts; DAG parent map (e.g. `year→month`, `jurisdiction→bank`) | 500K train, F1=1.000 (matches plaintext BN, 0pp gap) |
 | **Histogram Classifier** | count | Smoothed P(high\|feature=value) buckets; weighted average at predict time (no independence assumption) | 500K train; encrypted F1=0.884 vs plaintext histogram 0.789 on 50K test |
 | **Random Forests** | count | Ensemble of aggregate-count decision trees with random feature subsets. Reuses Decision Tree query caches when available, otherwise fetches its own count queries | Implemented in `blind_ml` and `fraud.ipynb`; validate against sklearn `RandomForestClassifier` |
+| **AdaBoost (stumps)** | count | Sequential ensemble of aggregate-count one-hot decision stumps. Reuses Decision Tree/Random Forest query caches when available, otherwise fetches its own count queries | Implemented in `blind_ml` and `fraud.ipynb`; validate against sklearn `AdaBoostClassifier` |
 
 ### Native Support
 
@@ -489,7 +490,6 @@ These algorithms can train **exactly** on encrypted aggregate counts in principl
 |-----------|-------------------|-----|
 | **Decision Trees (entropy/ID3)** | count | Information gain variant; same approach as demonstrated Gini/CART with a different splitting criterion |
 | **Ridge Regression** | count | Same as logistic regression with L2 penalty: β = (X'X + λI)⁻¹ X'y. Lambda tuned on holdout |
-| **AdaBoost (stumps)** | count | Sequential ensemble of depth-1 decision trees. Each stump trains from weighted class counts; weights update based on stump error rate |
 | **Gradient Boosted Trees (shallow)** | count | Sequential trees fit to residuals. Each iteration: compute residual distribution from aggregate counts, fit a shallow tree to the residual bins |
 | **Statistical Tests** | count | Chi-square, Fisher's exact, etc. from contingency tables built with counts |
 | **Association Rules** | count | Support = count(itemset) / count(all) |
@@ -526,7 +526,7 @@ These algorithms can be trained using binned or summarized statistics when per-v
 
 ## Learn More
 
-- **Run the fraud demo** (seven models: NB, GNB, BN, DT, RF, LR, Histogram): Open [`fraud.ipynb`](fraud.ipynb)
+- **Run the fraud demo** (eight models: NB, GNB, BN, DT, RF, AdaBoost, LR, Histogram): Open [`fraud.ipynb`](fraud.ipynb)
 - **Run the healthcare demo** (breast cancer risk prediction with HIPAA k=11): Open `BreastCancerRiskPrediction.ipynb`
 - **Read the code**: See `blind_ml/demo_helpers.py` (fraud) and `blind_ml/healthcare.py` (healthcare) for the implementations
 - **Blind Insight Docs**: https://docs.blindinsight.io

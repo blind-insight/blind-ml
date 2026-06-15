@@ -37,6 +37,11 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "fraud_rf_describe",
     "train_plaintext_rf_fraud",
     "fraud_plaintext_rf_predict_proba",
+    "run_encrypted_adaboost_fraud",
+    "fraud_adaboost_predict",
+    "fraud_adaboost_describe",
+    "train_plaintext_adaboost_fraud",
+    "fraud_plaintext_adaboost_predict_proba",
     "train_plaintext_dt_fraud",
     "fraud_plaintext_predict_proba",
     "fraud_model_summary_table",
@@ -114,6 +119,7 @@ def main() -> int:
                 "BayesianNetworkClassifierModel",
                 "HistogramClassifierModel",
                 "RandomForestModel",
+                "AdaBoostStumpModel",
             ],
         ),
     )
@@ -156,6 +162,7 @@ def main() -> int:
     def model_smoke():
 
         from blind_ml import (
+            AdaBoostStumpModel,
             BayesianNetworkClassifierModel,
             DecisionTreeModel,
             GaussianNaiveBayesModel,
@@ -249,9 +256,18 @@ def main() -> int:
         assert pred == 1
         assert risk > 0.5
 
+        boost = AdaBoostStumpModel(n_estimators=3).fit_from_counts(
+            count_fn=count_fn,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+            n_pos=2,
+            n_neg=2,
+        )
+        pred, risk = boost.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
 
     check(
-        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel(), DecisionTreeModel(), RandomForestModel()",
+        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel(), DecisionTreeModel(), RandomForestModel(), AdaBoostStumpModel()",
         model_smoke,
     )
 

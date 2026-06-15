@@ -1185,6 +1185,261 @@ class RandomForestModel:
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADABOOST  (aggregate-count decision stumps)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class AdaBoostStumpModel:
+    """AdaBoost over one-hot categorical decision stumps from aggregate counts.
+
+    The model is generic: ``fit_from_counts`` only needs class totals, candidate
+    feature values, and a count provider with the same contract as
+    ``DecisionTreeModel.fit_from_counts``. Sample weights are represented as
+    class-specific multipliers over regions induced by the stumps already
+    selected, so no row-level data is required.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        learning_rate: float = 1.0,
+        k_min: int = 0,
+        threshold: float = 0.5,
+    ) -> None:
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be >= 1")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+        self.n_estimators = int(n_estimators)
+        self.learning_rate = float(learning_rate)
+        self.k_min = int(k_min)
+        self.threshold = float(threshold)
+        self.stumps_: list[dict[str, Any]] = []
+        self.feature_columns: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.col_names: list[str] = []
+        self._col_set: set[str] = set()
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def fit_from_counts(
+        self,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
+        n_pos: int,
+        n_neg: int,
+    ) -> AdaBoostStumpModel:
+        """Train weighted decision stumps from aggregate conditional counts."""
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+        if n_pos < 0 or n_neg < 0:
+            raise ValueError("class totals must be non-negative")
+        n_total = int(n_pos) + int(n_neg)
+        if n_total <= 0:
+            raise ValueError("class totals must be non-zero")
+
+        self.feature_columns = list(feature_values.keys())
+        self.feature_values = {}
+        candidates: list[tuple[str, str, int, str]] = []
+        self.col_names = []
+        for feature in self.feature_columns:
+            seen: set[str] = set()
+            self.feature_values[feature] = []
+            for raw_value in feature_values[feature]:
+                value = self._norm_value(raw_value)
+                if value in seen:
+                    continue
+                seen.add(value)
+                self.feature_values[feature].append(value)
+                col_name = f"{feature}_{value}"
+                candidates.append((feature, value, len(self.col_names), col_name))
+                self.col_names.append(col_name)
+        self._col_set = set(self.col_names)
+        self.stumps_ = []
+
+        count_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+
+        def _count(
+            path: tuple[tuple[str, str, bool], ...],
+            feature: str,
+            value: str,
+            cls: int,
+        ) -> int:
+            key = (path, feature, value, int(cls))
+            if key not in count_cache:
+                count_cache[key] = int(count_fn(path, feature, value, int(cls)))
+            return count_cache[key]
+
+        regions: list[dict[str, Any]] = [
+            {
+                "path": tuple(),
+                "n_pos": int(n_pos),
+                "n_neg": int(n_neg),
+                "w_pos": 1.0 / n_total,
+                "w_neg": 1.0 / n_total,
+            }
+        ]
+        used_candidates: set[tuple[str, str]] = set()
+        eps = 1e-12
+
+        for _round_idx in range(self.n_estimators):
+            best: dict[str, Any] | None = None
+            total_weight = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in regions)
+            if total_weight <= eps:
+                break
+
+            for feature, value, col_idx, col_name in candidates:
+                if (feature, value) in used_candidates:
+                    continue
+
+                details: list[tuple[dict[str, Any], int, int, int, int]] = []
+                left_pos_w = left_neg_w = right_pos_w = right_neg_w = 0.0
+                left_pos_raw = left_neg_raw = right_pos_raw = right_neg_raw = 0
+
+                for region in regions:
+                    path = region["path"]
+                    left_pos = _count(path, feature, value, 1)
+                    left_neg = _count(path, feature, value, 0)
+                    if left_pos < 0 or left_neg < 0:
+                        raise ValueError("count_fn returned a negative count")
+                    if left_pos > region["n_pos"] or left_neg > region["n_neg"]:
+                        raise ValueError(
+                            "count_fn returned a split count larger than the current region total "
+                            f"for {feature}={value!r}"
+                        )
+
+                    right_pos = region["n_pos"] - left_pos
+                    right_neg = region["n_neg"] - left_neg
+                    details.append((region, left_pos, left_neg, right_pos, right_neg))
+
+                    left_pos_raw += left_pos
+                    left_neg_raw += left_neg
+                    right_pos_raw += right_pos
+                    right_neg_raw += right_neg
+                    left_pos_w += region["w_pos"] * left_pos
+                    left_neg_w += region["w_neg"] * left_neg
+                    right_pos_w += region["w_pos"] * right_pos
+                    right_neg_w += region["w_neg"] * right_neg
+
+                left_n = left_pos_raw + left_neg_raw
+                right_n = right_pos_raw + right_neg_raw
+                if left_n == 0 or right_n == 0:
+                    continue
+                if self.k_min > 0 and (0 < left_pos_raw < self.k_min or 0 < right_pos_raw < self.k_min):
+                    continue
+
+                left_pred = 1 if left_pos_w >= left_neg_w else 0
+                right_pred = 1 if right_pos_w >= right_neg_w else 0
+                if left_pred == right_pred:
+                    continue
+
+                error = (left_neg_w if left_pred == 1 else left_pos_w) + (
+                    right_neg_w if right_pred == 1 else right_pos_w
+                )
+                error /= total_weight
+                if best is None or error < best["error"]:
+                    best = {
+                        "feature": feature,
+                        "value": value,
+                        "col_idx": col_idx,
+                        "col_name": col_name,
+                        "left_pred": left_pred,
+                        "right_pred": right_pred,
+                        "left_risk": left_pos_raw / max(1, left_n),
+                        "right_risk": right_pos_raw / max(1, right_n),
+                        "left_n": left_n,
+                        "right_n": right_n,
+                        "left_pos": left_pos_raw,
+                        "left_neg": left_neg_raw,
+                        "right_pos": right_pos_raw,
+                        "right_neg": right_neg_raw,
+                        "error": float(error),
+                        "details": details,
+                    }
+
+            if best is None or best["error"] >= 0.5:
+                break
+
+            raw_error = best["error"]
+            clipped_error = min(max(raw_error, eps), 1.0 - eps)
+            alpha = self.learning_rate * 0.5 * math.log((1.0 - clipped_error) / clipped_error)
+            stump = {k: v for k, v in best.items() if k != "details"}
+            stump["alpha"] = float(alpha)
+            self.stumps_.append(stump)
+            used_candidates.add((best["feature"], best["value"]))
+
+            new_regions: list[dict[str, Any]] = []
+            for region, left_pos, left_neg, right_pos, right_neg in best["details"]:
+                for branch, pred, pos_count, neg_count in (
+                    (True, best["left_pred"], left_pos, left_neg),
+                    (False, best["right_pred"], right_pos, right_neg),
+                ):
+                    if pos_count + neg_count == 0:
+                        continue
+                    pos_factor = math.exp(-alpha) if pred == 1 else math.exp(alpha)
+                    neg_factor = math.exp(-alpha) if pred == 0 else math.exp(alpha)
+                    new_regions.append(
+                        {
+                            "path": region["path"] + ((best["feature"], best["value"], branch),),
+                            "n_pos": pos_count,
+                            "n_neg": neg_count,
+                            "w_pos": region["w_pos"] * pos_factor,
+                            "w_neg": region["w_neg"] * neg_factor,
+                        }
+                    )
+
+            norm = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in new_regions)
+            if norm <= eps:
+                break
+            for region in new_regions:
+                region["w_pos"] /= norm
+                region["w_neg"] /= norm
+            regions = new_regions
+
+            if raw_error <= eps:
+                break
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, boosted_risk)`` for one row."""
+        if not self.stumps_:
+            return 0, 0.0
+
+        active: set[str] = set()
+        for feature in self.feature_columns:
+            raw_value = row_features.get(feature, "")
+            cname = f"{feature}_{raw_value}"
+            cname_norm = f"{feature}_{self._norm_value(raw_value)}"
+            if cname in self._col_set:
+                active.add(cname)
+            elif cname_norm in self._col_set:
+                active.add(cname_norm)
+
+        score = 0.0
+        for stump in self.stumps_:
+            pred = stump["left_pred"] if stump["col_name"] in active else stump["right_pred"]
+            score += stump["alpha"] * (1.0 if pred == 1 else -1.0)
+
+        margin = 2.0 * score
+        if margin >= 0:
+            risk = 1.0 / (1.0 + math.exp(-margin))
+        else:
+            exp_margin = math.exp(margin)
+            risk = exp_margin / (1.0 + exp_margin)
+        return (1 if risk >= self.threshold else 0), float(risk)
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HISTOGRAM CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════════════════

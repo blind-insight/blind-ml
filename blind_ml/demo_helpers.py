@@ -18,6 +18,9 @@ import numpy as np
 import pandas as pd
 
 from .models import (
+    AdaBoostStumpModel as _AdaBoostStumpModel,
+)
+from .models import (
     BayesianNetworkClassifierModel as _BayesianNetworkClassifierModel,
 )
 from .models import (
@@ -2268,6 +2271,211 @@ def fraud_plaintext_rf_predict_proba(
     feature_values: dict[str, list[str]],
 ) -> list[float]:
     """Predict P(high_risk) using a trained sklearn RandomForestClassifier."""
+    return fraud_plaintext_predict_proba(model, col_names, df_test, feature_values)
+
+
+# =============================================================================
+# ENCRYPTED ADABOOST (fraud)
+# =============================================================================
+
+
+def run_encrypted_adaboost_fraud(
+    feature_values: dict[str, list[str]] | None = None,
+    dt_result: dict | None = None,
+    rf_result: dict | None = None,
+    raw_results: list[tuple] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    n_estimators: int = 10,
+    learning_rate: float = 1.0,
+    k_min: int = 0,
+    client=None,
+    org: str | None = None,
+    dataset: str | None = None,
+    schema: str | None = None,
+    max_workers: int = 10,
+) -> dict[str, Any]:
+    """Train fraud AdaBoost stumps from encrypted aggregate counts.
+
+    ``rf_result`` and ``dt_result`` are optional cache sources. If neither is
+    supplied, the helper fetches the required BI counts itself so the notebook
+    cell can run independently.
+    """
+    cache_source = rf_result or dt_result
+    if not feature_values:
+        if cache_source and cache_source.get("feature_values"):
+            feature_values = cache_source["feature_values"]
+        else:
+            raise ValueError(
+                "run_encrypted_adaboost_fraud requires feature_values, rf_result, or dt_result "
+                "with feature_values."
+            )
+
+    has_bi_context = client is not None and org and dataset and schema
+    if not has_bi_context:
+        raise ValueError("run_encrypted_adaboost_fraud requires BI client/org/dataset/schema.")
+
+    raw_results_source = "provided" if raw_results is not None else "adaboost_rerun"
+    base_rate_queries = 0
+    marginal_queries = 0
+    initial_cache: dict[str, int] = {}
+
+    for candidate_source, source_name in ((rf_result, "rf_result"), (dt_result, "dt_result")):
+        if not candidate_source:
+            continue
+        if raw_results is None and candidate_source.get("raw_results") is not None:
+            raw_results = candidate_source["raw_results"]
+            raw_results_source = source_name
+        if n_high is None and candidate_source.get("n_high") is not None:
+            n_high = candidate_source["n_high"]
+        if n_low is None and candidate_source.get("n_low") is not None:
+            n_low = candidate_source["n_low"]
+        initial_cache.update(candidate_source.get("query_cache", {}))
+
+    if n_high is None or n_low is None:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        raw_results = _run_fraud_marginal_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            max_workers=max_workers,
+        )
+        marginal_queries = len(raw_results)
+        raw_results_source = "adaboost_rerun"
+
+    count_fn, query_count, boost_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        aggregate_cache=initial_cache,
+    )
+
+    model = _AdaBoostStumpModel(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        k_min=k_min,
+    ).fit_from_counts(
+        count_fn=count_fn,
+        feature_values=boost_feature_values,
+        n_pos=n_high,
+        n_neg=n_low,
+    )
+
+    additional_adaboost_queries = query_count()
+    enc_queries = marginal_queries + additional_adaboost_queries
+    return {
+        "_model": model,
+        "stumps": model.stumps_,
+        "feature_values": feature_values,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "query_cache": aggregate_cache,
+        "counts_from_bi": True,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_estimators": n_estimators,
+        "learning_rate": learning_rate,
+        "k_min": k_min,
+        "train_time": model.train_time,
+        "enc_queries": enc_queries,
+        "base_rate_queries": base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "additional_adaboost_queries": additional_adaboost_queries,
+        "total_aggregate_calls": enc_queries + base_rate_queries,
+        "reused_cache_entries": len(initial_cache),
+    }
+
+
+def fraud_adaboost_predict(boost_result: dict, row: dict) -> tuple[int, float]:
+    """Predict using the encrypted fraud AdaBoost model."""
+    model = boost_result.get("_model")
+    if not model:
+        return 0, 0.0
+    row_normalized = dict(row)
+    for col in _FRAUD_FEATURES_ORDERED:
+        if col in row_normalized:
+            row_normalized[col] = str(row_normalized[col]).lower()
+    return model.predict(row_normalized)
+
+
+def fraud_adaboost_describe(boost_result: dict, max_stumps: int = 5) -> str:
+    """Return a compact text description of the fraud AdaBoost stumps."""
+    model = boost_result.get("_model")
+    if not model or not model.stumps_:
+        return "Empty AdaBoost model"
+
+    lines = [
+        f"AdaBoost: {len(model.stumps_)} stumps, "
+        f"learning_rate={model.learning_rate}, threshold={model.threshold}"
+    ]
+    for idx, stump in enumerate(model.stumps_[:max_stumps], 1):
+        lines.append(
+            f"Stump {idx}: {stump['col_name']}? "
+            f"alpha={stump['alpha']:.4f}, error={stump['error']:.4f}, "
+            f"YES->{stump['left_pred']} (risk={stump['left_risk']:.3f}, n={stump['left_n']:,}), "
+            f"NO->{stump['right_pred']} (risk={stump['right_risk']:.3f}, n={stump['right_n']:,})"
+        )
+    if len(model.stumps_) > max_stumps:
+        lines.append(f"... {len(model.stumps_) - max_stumps} more stumps")
+    return "\n".join(lines)
+
+
+def train_plaintext_adaboost_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    n_estimators: int = 10,
+    learning_rate: float = 1.0,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a sklearn AdaBoostClassifier with decision stumps on fraud data."""
+    from sklearn.ensemble import AdaBoostClassifier
+    from sklearn.tree import DecisionTreeClassifier
+
+    start = time.time()
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    features = list(_FRAUD_FEATURE_MAP.keys())
+    X = df2[features].copy()
+    for col in features:
+        X[col] = X[col].astype(str)
+    X_encoded = pd.get_dummies(X, columns=features, drop_first=False)
+    col_names = X_encoded.columns.tolist()
+    y = df2["is_high_risk"]
+
+    stump = DecisionTreeClassifier(max_depth=1, random_state=random_state)
+    try:
+        model = AdaBoostClassifier(
+            estimator=stump,
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            random_state=random_state,
+        )
+    except TypeError:
+        model = AdaBoostClassifier(
+            base_estimator=stump,
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            random_state=random_state,
+        )
+    model.fit(X_encoded, y)
+    return {"model": model, "col_names": col_names, "train_time": time.time() - start}
+
+
+def fraud_plaintext_adaboost_predict_proba(
+    model,
+    col_names: list[str],
+    df_test: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+) -> list[float]:
+    """Predict P(high_risk) using a trained sklearn AdaBoostClassifier."""
     return fraud_plaintext_predict_proba(model, col_names, df_test, feature_values)
 
 
