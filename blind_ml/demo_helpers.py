@@ -1917,10 +1917,7 @@ def fraud_dt_describe(dt_result: dict) -> str:
     def _desc(node: dict, indent: int = 0) -> list[str]:
         pre = "  " * indent
         if node["type"] == "leaf":
-            return [
-                f"{pre}-> risk={node['risk']:.4f} "
-                f"(n={node['n']:,}, pos={node['n_pos']:,}, neg={node['n_neg']:,})"
-            ]
+            return [f"{pre}-> risk={node['risk']:.4f} (n={node['n']:,}, pos={node['n_pos']:,}, neg={node['n_neg']:,})"]
 
         gain = node.get("gain", node.get("bi_root_gain", 0.0))
         lines = [f"{pre}{node['col_name']}? gain={gain:.4f} (n={node['n']:,})"]
@@ -2137,8 +2134,7 @@ def fraud_rf_describe(rf_result: dict, max_trees: int = 3) -> str:
         return "Empty forest"
 
     lines = [
-        f"Random Forest: {len(model.estimators_)} trees, "
-        f"max_depth={model.max_depth}, max_features={model.max_features}"
+        f"Random Forest: {len(model.estimators_)} trees, max_depth={model.max_depth}, max_features={model.max_features}"
     ]
     for idx, (tree, subset) in enumerate(zip(model.estimators_[:max_trees], model.feature_subsets_[:max_trees]), 1):
         lines.append(f"\nTree {idx} features: {', '.join(subset)}")
@@ -2224,8 +2220,7 @@ def run_encrypted_adaboost_fraud(
             feature_values = cache_source["feature_values"]
         else:
             raise ValueError(
-                "run_encrypted_adaboost_fraud requires feature_values, rf_result, or dt_result "
-                "with feature_values."
+                "run_encrypted_adaboost_fraud requires feature_values, rf_result, or dt_result with feature_values."
             )
 
     has_bi_context = client is not None and org and dataset and schema
@@ -2328,10 +2323,7 @@ def fraud_adaboost_describe(boost_result: dict, max_stumps: int = 5) -> str:
     if not model or not model.stumps_:
         return "Empty AdaBoost model"
 
-    lines = [
-        f"AdaBoost: {len(model.stumps_)} stumps, "
-        f"learning_rate={model.learning_rate}, threshold={model.threshold}"
-    ]
+    lines = [f"AdaBoost: {len(model.stumps_)} stumps, learning_rate={model.learning_rate}, threshold={model.threshold}"]
     for idx, stump in enumerate(model.stumps_[:max_stumps], 1):
         lines.append(
             f"Stump {idx}: {stump['col_name']}? "

@@ -817,8 +817,7 @@ class DecisionTreeModel:
                     raise ValueError("count_fn returned a negative count")
                 if left_pos > n_pos_node or left_neg > n_neg_node:
                     raise ValueError(
-                        "count_fn returned a split count larger than the current node total "
-                        f"for {feature}={value!r}"
+                        f"count_fn returned a split count larger than the current node total for {feature}={value!r}"
                     )
 
                 left_n = left_pos + left_neg
@@ -830,9 +829,7 @@ class DecisionTreeModel:
                 if _k > 0 and (0 < left_pos < _k or 0 < right_pos < _k):
                     continue
 
-                weighted_imp = (left_n / n) * imp_fn(left_pos, left_neg) + (right_n / n) * imp_fn(
-                    right_pos, right_neg
-                )
+                weighted_imp = (left_n / n) * imp_fn(left_pos, left_neg) + (right_n / n) * imp_fn(right_pos, right_neg)
                 gain = base_imp - weighted_imp
                 if best is None or gain > best[0]:
                     best = (gain, feature, value, col_idx, col_name, left_pos, left_neg, right_pos, right_neg)
@@ -884,7 +881,6 @@ class DecisionTreeModel:
 
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
