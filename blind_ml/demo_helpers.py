@@ -1635,8 +1635,7 @@ def _fraud_row_features(row: dict) -> dict[str, str]:
 
 
 # Maps the ``feat_type`` strings used in ``raw_results`` tuples (produced by
-# ``_bi_queries``) back to the actual DataFrame column names. Used by
-# ``run_encrypted_dt_fraud`` to feed BI counts into the tree's root split.
+# ``_bi_queries``) back to fraud column names for the DT aggregate query cache.
 _FRAUD_FEAT_TYPE_TO_COLUMN = {
     "fraud": "fraud_type",
     "jur": "account_jurisdiction",
@@ -1805,138 +1804,66 @@ def _build_fraud_dt_count_provider(
 
 
 def run_encrypted_dt_fraud(
+    feature_values: dict[str, list[str]],
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
     raw_results: list[tuple] | None = None,
-    feature_values: dict[str, list[str]] | None = None,
-    df_local: pd.DataFrame | None = None,
     n_high: int | None = None,
     n_low: int | None = None,
     max_depth: int = 3,
     k_min: int = 0,
     criterion: str = "gini",
-    client=None,
-    org: str | None = None,
-    dataset: str | None = None,
-    schema: str | None = None,
     max_workers: int = 10,
 ) -> dict[str, Any]:
-    """Build a fraud decision tree from encrypted aggregate counts.
-
-    If ``client``/``org``/``dataset``/``schema`` are supplied, all splits are
-    trained from BI aggregate counts via ``DecisionTreeModel.fit_from_counts``.
-    Without those BI arguments, this preserves the older notebook behavior:
-    root split from ``raw_results`` and deeper splits from ``df_local``.
-    """
+    """Build a fraud decision tree entirely from encrypted aggregate counts."""
     if not feature_values:
         raise ValueError("run_encrypted_dt_fraud requires feature_values.")
+    if client is None or not org or not dataset or not schema:
+        raise ValueError("run_encrypted_dt_fraud requires BI client/org/dataset/schema.")
 
-    has_bi_context = client is not None and org and dataset and schema
     raw_results_source = "provided"
     base_rate_queries = 0
 
-    if has_bi_context:
-        if n_high is None or n_low is None:
-            n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
-            base_rate_queries = 2
-        if raw_results is None:
-            queries = _bi_queries(feature_values)
-
-            def run_query(q):
-                f_type, r_class, val, q_str = q
-                count = get_encrypted_count(client, org, dataset, schema, q_str)
-                return (f_type, r_class, val, count)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                raw_results = list(executor.map(run_query, queries))
-            raw_results_source = "dt_rerun"
-    elif not raw_results:
-        raise ValueError(
-            "run_encrypted_dt_fraud needs either BI client/org/dataset/schema to fetch "
-            "Decision Tree counts or raw_results from a previous aggregate-count run."
-        )
-
-    raw_results = raw_results or []
     if n_high is None or n_low is None:
-        raise ValueError("run_encrypted_dt_fraud requires n_high and n_low base-rate counts from BI.")
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        queries = _bi_queries(feature_values)
+
+        def run_query(q):
+            f_type, r_class, val, q_str = q
+            count = get_encrypted_count(client, org, dataset, schema, q_str)
+            return (f_type, r_class, val, count)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results = list(executor.map(run_query, queries))
+        raw_results_source = "dt_rerun"
+
     if n_high + n_low == 0:
         raise ValueError(
             "run_encrypted_dt_fraud requires non-zero BI base rates. "
             "Got n_high=n_low=0 — check that BI ingest completed."
         )
 
-    if has_bi_context:
-        count_fn, query_count, dt_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
-            client=client,
-            org=org,
-            dataset=dataset,
-            schema=schema,
-            feature_values=feature_values,
-            raw_results=raw_results,
-        )
-        dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
-        dt.fit_from_counts(
-            count_fn=count_fn,
-            feature_values=dt_feature_values,
-            n_pos=n_high,
-            n_neg=n_low,
-        )
-        if dt.tree is not None:
-            dt.tree["bi_counts"] = True
-
-        return {
-            "_model": dt,
-            "tree": dt.tree,
-            "col_names": dt.col_names,
-            "_col_set": dt._col_set,
-            "features": dt.feature_columns,
-            "feature_values": feature_values,
-            "train_time": dt.train_time,
-            "criterion": criterion,
-            "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
-            "root_gain": dt.tree.get("gain", 0) if dt.tree else 0,
-            "root_from_bi": True,
-            "counts_from_bi": True,
-            "local_fallback": False,
-            "enc_queries": len(raw_results) + query_count(),
-            "base_rate_queries": base_rate_queries,
-            "total_aggregate_calls": len(raw_results) + query_count() + base_rate_queries,
-            "raw_results_source": raw_results_source,
-            "additional_dt_queries": query_count(),
-            "raw_results": raw_results,
-            "query_cache": aggregate_cache,
-            "n_high": n_high,
-            "n_low": n_low,
-            "root_children": {},
-            "tree_nodes": {},
-        }
-
-    if df_local is None:
-        raise ValueError(
-            "run_encrypted_dt_fraud needs either BI client/org/dataset/schema for count-only "
-            "training or df_local for the legacy local deeper-split fallback."
-        )
-
-    df = df_local.copy()
-    df["is_high_risk"] = (df["risk_level"].astype(int) >= 50).astype(int)
-
-    # Case normalization: raw_results values come from `_bi_queries`, which
-    # mixes lowercased (fraud_type, jur, active) and original-case (bank_id,
-    # month, year) values. pd.get_dummies builds column names from the df's
-    # actual values. To make `f"{col}_{val}"` align on both sides, lowercase
-    # both the local df values AND the raw_results values uniformly.
-    for col in _FRAUD_FEATURES_ORDERED:
-        df[col] = df[col].astype(str).str.lower()
-    raw_results = [(ft, cls, str(val).lower(), cnt) for ft, cls, val, cnt in raw_results]
-
-    dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
-    dt.fit_with_bi_root(
+    count_fn, query_count, dt_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
         raw_results=raw_results,
-        feat_type_to_column=_FRAUD_FEAT_TYPE_TO_COLUMN,
-        df=df,
-        feature_columns=_FRAUD_FEATURES_ORDERED,
-        target_col="is_high_risk",
+    )
+    dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
+    dt.fit_from_counts(
+        count_fn=count_fn,
+        feature_values=dt_feature_values,
         n_pos=n_high,
         n_neg=n_low,
     )
+    if dt.tree is not None:
+        dt.tree["bi_counts"] = True
 
     return {
         "_model": dt,
@@ -1948,17 +1875,16 @@ def run_encrypted_dt_fraud(
         "train_time": dt.train_time,
         "criterion": criterion,
         "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
-        "root_gain": dt.tree.get("bi_root_gain", 0) if dt.tree else 0,
-        "root_from_bi": dt.tree.get("bi_root", False) if dt.tree else False,
-        "counts_from_bi": False,
-        "local_fallback": True,
-        "enc_queries": len(raw_results),
+        "root_gain": dt.tree.get("gain", 0) if dt.tree else 0,
+        "root_from_bi": True,
+        "counts_from_bi": True,
+        "enc_queries": len(raw_results) + query_count(),
         "base_rate_queries": base_rate_queries,
-        "total_aggregate_calls": len(raw_results) + base_rate_queries,
+        "total_aggregate_calls": len(raw_results) + query_count() + base_rate_queries,
         "raw_results_source": raw_results_source,
-        "additional_dt_queries": 0,
+        "additional_dt_queries": query_count(),
         "raw_results": raw_results,
-        "query_cache": {},
+        "query_cache": aggregate_cache,
         "n_high": n_high,
         "n_low": n_low,
         "root_children": {},
