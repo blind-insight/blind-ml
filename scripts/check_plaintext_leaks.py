@@ -158,9 +158,7 @@ def check_models(paths: list[Path] | None = None) -> list[str]:
                 body_text = _body_source(item, source_lines)
 
                 has_df_param = any(
-                    arg.arg in ("df", "df_local", "dataframe")
-                    for arg in item.args.args
-                    if arg.arg != "self"
+                    arg.arg in ("df", "df_local", "dataframe") for arg in item.args.args if arg.arg != "self"
                 )
 
                 has_df_annotation = False
@@ -169,17 +167,12 @@ def check_models(paths: list[Path] | None = None) -> list[str]:
                         has_df_annotation = True
                         break
 
-                has_df_body = any(
-                    indicator in body_text for indicator in DF_BODY_INDICATORS
-                )
+                has_df_body = any(indicator in body_text for indicator in DF_BODY_INDICATORS)
 
                 # Check three ways: parameter names, type annotations, and body operations.
                 # Any single match is enough to flag a violation.
                 if has_df_param or has_df_annotation or has_df_body:
-                    violations.append(
-                        f"{rel}:{item.lineno}  {node.name}.{name}() "
-                        f"uses DataFrame training"
-                    )
+                    violations.append(f"{rel}:{item.lineno}  {node.name}.{name}() uses DataFrame training")
 
     return violations
 
@@ -207,10 +200,7 @@ def check_functions(paths: list[Path] | None = None) -> list[str]:
             # Check two ways: forbidden parameter names, and forbidden patterns in the body.
             reasons: list[str] = []
 
-            bad_params = [
-                arg.arg for arg in node.args.args
-                if arg.arg in ENCRYPTED_PARAM_FORBIDDEN
-            ]
+            bad_params = [arg.arg for arg in node.args.args if arg.arg in ENCRYPTED_PARAM_FORBIDDEN]
             if bad_params:
                 reasons.append(f"param {', '.join(bad_params)}")
 
@@ -221,10 +211,7 @@ def check_functions(paths: list[Path] | None = None) -> list[str]:
 
             if reasons:
                 detail = "; ".join(reasons)
-                violations.append(
-                    f"{rel}:{node.lineno}  {node.name}() "
-                    f"references plaintext training: {detail}"
-                )
+                violations.append(f"{rel}:{node.lineno}  {node.name}() references plaintext training: {detail}")
 
     return violations
 
