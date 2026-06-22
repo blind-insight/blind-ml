@@ -50,3 +50,16 @@ jobs:
 
       - name: Import smoke test
         run: python scripts/smoke_test.py
+
+  plaintext-guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Plaintext leak check
+        run: python scripts/check_plaintext_leaks.py --all
