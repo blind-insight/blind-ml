@@ -777,9 +777,7 @@ def _build_bc_dt_count_provider(
         parent_path = path[:-1]
         split_feature, split_value, branch = path[-1]
         parent_total = _path_bound(parent_path, class_label)
-        equalities, exclusions, possible = _path_constraints(
-            parent_path + ((split_feature, split_value, True),)
-        )
+        equalities, exclusions, possible = _path_constraints(parent_path + ((split_feature, split_value, True),))
         left_total = _count_with_exclusions(equalities, exclusions, class_label) if possible else 0
         left_total = min(parent_total, max(0, int(left_total)))
         total = left_total if branch else max(0, parent_total - left_total)
@@ -1522,9 +1520,7 @@ def _bc_bn_cpt_count_queries(
             class_filter = _bc_class_filter(class_label)
             for parent_combo in parent_combos:
                 parent_state = tuple((parent, str(value).lower()) for parent, value in zip(parents, parent_combo))
-                parent_filters = [
-                    _bi_feat_filter(parent, str(value)) for parent, value in zip(parents, parent_combo)
-                ]
+                parent_filters = [_bi_feat_filter(parent, str(value)) for parent, value in zip(parents, parent_combo)]
                 for value in values_by_feature.get(feature, []):
                     filters = [class_filter, *parent_filters, _bi_feat_filter(feature, value)]
                     queries.append((feature, class_label, parent_state, str(value).lower(), filters))
@@ -1855,7 +1851,9 @@ def run_encrypted_histogram_bc(
         "suppressed_cells": list(bi_raw.get("suppressed_cells", [])) if raw_results_source == "bi_raw" else [],
         "suppression_policy": bi_raw.get(
             "suppression_policy",
-            "none" if min_cell_size <= 1 else f"cms_k{min_cell_size}_fixed_midpoint_{_suppression_replacement(min_cell_size)}",
+            "none"
+            if min_cell_size <= 1
+            else f"cms_k{min_cell_size}_fixed_midpoint_{_suppression_replacement(min_cell_size)}",
         ),
     }
 
@@ -2393,9 +2391,7 @@ def run_encrypted_lr_bc_ols(
         "suppressed_cells": list(pairwise.get("suppressed_cells", [])),
         "min_cell_size": min_cell_size,
         "suppression_policy": (
-            "none"
-            if min_cell_size <= 1
-            else f"cms_k{min_cell_size}_pairwise_independence_estimate"
+            "none" if min_cell_size <= 1 else f"cms_k{min_cell_size}_pairwise_independence_estimate"
         ),
         "ridge_lambda": ridge_lambda,
         "train_time": train_time,
