@@ -8,7 +8,7 @@
 | Notebook                                     | Domain                                             | Models                                                                 | Scale                                              |
 | -------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------- |
 | [`fraud.ipynb`](fraud.ipynb)                 | Cross-border fraud (IBANs, jurisdictions, reports) | Eight models (NB, GNB, BN, DT, RF, AdaBoost, LR, Histogram) | 50K per batch — upload as many batches as you want |
-| [`breast_cancer.ipynb`](breast_cancer.ipynb) | Breast cancer screening risk (HIPAA k=11 binning)  | Naive Bayes, Decision Tree, Logistic Regression + Gail/BCSC benchmarks | 20K per batch — upload as many as you want         |
+| [`breast_cancer.ipynb`](breast_cancer.ipynb) | Breast cancer screening risk (HIPAA k=11 binning)  | Eight encrypted ML models (NB, GNB, BN, DT, RF, AdaBoost, LR, Histogram) + Gail/BCSC benchmarks | 20K per batch — upload as many as you want         |
 
 
 Both demos match their sklearn plaintext counterparts while training **only on encrypted aggregate queries** (no record-level decryption during training).
@@ -203,7 +203,7 @@ Reads `.env`, uploads each batch, polls jobs to completion. Or use the same Web 
 jupyter notebook breast_cancer.ipynb
 ```
 
-Trains Naive Bayes, Decision Tree, and Logistic Regression on encrypted aggregates (HIPAA k=11 binning) and benchmarks against Gail-model / SEER relative risks.
+Trains eight encrypted ML models on BI aggregate counts with HIPAA k=11 suppression: Naive Bayes, Gaussian NB, Bayesian Network, Decision Tree, Random Forest, AdaBoost, aggregate OLS/ridge Logistic Regression, and Histogram Classifier. Gail-model / BCSC clinical comparisons stay separate.
 
 ---
 
