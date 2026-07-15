@@ -66,10 +66,10 @@ ENCRYPTED_NAMED = {
     "get_bc_base_rates",
 }
 
-# Pandas operations that indicate raw-data training. Searched inside fit*
-# method bodies (Guardrail 1). Parentheses/brackets are included to avoid
-# partial matches (e.g. "pd.get_dummies(" won't match a variable name).
-DF_BODY_INDICATORS = {
+# Patterns that indicate plaintext training inside fit* method bodies
+# (Guardrail 1). Covers DataFrame operations, sklearn usage, and direct
+# data-loading calls. Parentheses/brackets avoid partial matches.
+FIT_BODY_INDICATORS = {
     "pd.DataFrame",
     "pd.get_dummies(",
     "pd.to_numeric(",
@@ -77,6 +77,10 @@ DF_BODY_INDICATORS = {
     ".iterrows()",
     "df[",
     "df_local[",
+    "sklearn",
+    "read_csv(",
+    "read_sql",
+    "read_parquet(",
 }
 
 
@@ -118,16 +122,25 @@ def _is_encrypted_function(name: str) -> bool:
 
 
 def _body_source(node: ast.FunctionDef, source_lines: list[str]) -> str:
-    """Extract the source text of a function body."""
+    """Extract the source text of a function body, excluding docstrings."""
     if not node.body:
         return ""
-    start = node.body[0].lineno - 1
+    stmts = node.body
+    if (
+        isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, (ast.Constant, ast.JoinedStr))
+        and isinstance(getattr(stmts[0].value, "value", None), str)
+    ):
+        stmts = stmts[1:]
+    if not stmts:
+        return ""
+    start = stmts[0].lineno - 1
     end = node.end_lineno or (start + 1)
     return "\n".join(source_lines[start:end])
 
 
 def check_models(paths: list[Path] | None = None) -> list[str]:
-    """Guardrail 1: scan model classes for fit* methods that use DataFrame training."""
+    """Guardrail 1: scan model classes for fit* methods that use plaintext training."""
     violations: list[str] = []
     targets = paths or MODELS_FILES
 
@@ -167,12 +180,12 @@ def check_models(paths: list[Path] | None = None) -> list[str]:
                         has_df_annotation = True
                         break
 
-                has_df_body = any(indicator in body_text for indicator in DF_BODY_INDICATORS)
+                has_df_body = any(indicator in body_text for indicator in FIT_BODY_INDICATORS)
 
                 # Check three ways: parameter names, type annotations, and body operations.
                 # Any single match is enough to flag a violation.
                 if has_df_param or has_df_annotation or has_df_body:
-                    violations.append(f"{rel}:{item.lineno}  {node.name}.{name}() uses DataFrame training")
+                    violations.append(f"{rel}:{item.lineno}  {node.name}.{name}() uses plaintext training")
 
     return violations
 
