@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-import sys
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from check_plaintext_leaks import check_functions, check_models
+
+from check_plaintext_leaks import check_functions, check_models  # noqa: E402
 
 _TMP_DIR = REPO_ROOT / ".test_tmp"
 _counter = 0
