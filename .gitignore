@@ -255,9 +255,7 @@ demo_data/upload_batches/*
 # Local smoketest / scratch (scripts/smoke_test.py is tracked; its venv is not)
 .venv-smoke/
 venv-smoke/
-
-# Test cases
-tests/
+.test_tmp
 
 # Claude
 Claude.md
