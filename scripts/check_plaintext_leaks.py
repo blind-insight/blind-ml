@@ -97,17 +97,21 @@ ENCRYPTED_BODY_FORBIDDEN = {
     ".fit(df_local",
     ".fit(X,",
     ".fit(X_encoded",
+    ".fit(features",
+    ".fit(matrix",
     "pd.get_dummies(",
     "pd.to_numeric(",
     "pd.crosstab(",
     "pd.read_sql",
     "pd.read_csv(",
+    "read_csv(",
     "sklearn",
 }
 
 # Parameter names that indicate a function receives local data.
-# An encrypted function should never need a DataFrame passed in.
-ENCRYPTED_PARAM_FORBIDDEN = {"df", "df_local", "df_train", "X_train"}
+# An encrypted function should receive BI client/org/dataset/schema,
+# not raw arrays or DataFrames.
+ENCRYPTED_PARAM_FORBIDDEN = {"df", "df_local", "df_train", "X_train", "X", "y", "Y", "features", "labels"}
 
 
 def _is_encrypted_function(name: str) -> bool:
