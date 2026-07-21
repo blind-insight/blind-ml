@@ -1182,8 +1182,14 @@ def run_encrypted_adaboost_bc(
     learning_rate: float = 1.0,
     k_min: int = CMS_MIN_CELL_SIZE,
     max_workers: int = 48,
+    max_regions: int | None = None,
 ) -> dict[str, Any]:
-    """Train BC AdaBoost decision stumps from BI aggregate counts only."""
+    """Train BC AdaBoost decision stumps from BI aggregate counts only.
+
+    max_regions: PROTOTYPE region pruning (default None = exact). Caps the
+    boosting partition to the top-N regions by weight each round to bound the
+    per-round query explosion; approximate. See AdaBoostStumpModel.fit_from_counts.
+    """
     cache_source = rf_result or dt_result
     if not feature_values:
         if cache_source and cache_source.get("feature_values"):
@@ -1250,6 +1256,7 @@ def run_encrypted_adaboost_bc(
         n_pos=int(n_cancer),
         n_neg=int(n_no_cancer),
         max_workers=max_workers,
+        max_regions=max_regions,
     )
 
     additional_adaboost_queries = query_count()

@@ -1074,8 +1074,18 @@ class AdaBoostStumpModel:
         n_pos: int,
         n_neg: int,
         max_workers: int = 1,
+        max_regions: int | None = None,
     ) -> AdaBoostStumpModel:
-        """Train weighted decision stumps from aggregate conditional counts."""
+        """Train weighted decision stumps from aggregate conditional counts.
+
+        max_regions : int | None
+            PROTOTYPE region pruning. AdaBoost's partition can nearly double each
+            round (every region splits), so per-round queries grow as
+            regions x candidates. When set, cap the partition to the top-N regions
+            by weight after each split, dropping the negligible tail. This bounds
+            the query explosion at the cost of a small approximation (dropped
+            regions no longer inform later stumps). Default None = exact.
+        """
         start = time.time()
         if not feature_values:
             raise ValueError("feature_values must contain at least one feature")
@@ -1252,6 +1262,15 @@ class AdaBoostStumpModel:
                             "w_neg": region["w_neg"] * neg_factor,
                         }
                     )
+
+            # PROTOTYPE region pruning: keep only the top-N regions by weight so
+            # the next round's query count stays bounded (regions x candidates).
+            if max_regions is not None and len(new_regions) > max_regions:
+                new_regions.sort(
+                    key=lambda r: r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"],
+                    reverse=True,
+                )
+                del new_regions[max_regions:]
 
             norm = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in new_regions)
             if norm <= eps:
