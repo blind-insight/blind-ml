@@ -459,6 +459,41 @@ def _count_via_class_aggregate(client, org, dataset, schema, filters: list[str],
             time.sleep(1.5 * (attempt + 1))
 
 
+def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
+    """Drop-in replacement for ``_count_only`` using the class-count aggregate path.
+
+    Expresses the ``cancer_5yr`` class filter as ``cancer_5yr:count(<value>)`` and
+    sends the remaining equality filters as ``extra_filters``. Returns the same int
+    count as ``_count_only`` but in ONE POST (vs count_only's two round-trips) and
+    with no depth-4 / HTTP-422 ceiling. If no class filter is present it falls back
+    to ``_count_only`` (nothing to aggregate on).
+    """
+    class_value = None
+    extra: list[str] = []
+    for f in filters:
+        if f in ("cancer_5yr:1", "cancer_5yr:0"):
+            class_value = f.split(":", 1)[1]
+        else:
+            extra.append(f)
+    if class_value is None:
+        return _count_only(client, org, dataset, schema, filters, retries=retries)
+    agg_filter = f"cancer_5yr:count({class_value})"
+    for attempt in range(retries):
+        try:
+            result = client.aggregate(
+                organization=org,
+                dataset_slug=dataset,
+                schema_slug=schema,
+                agg_filter=agg_filter,
+                extra_filters=extra,
+            )
+            return int(_bc_agg_value(result))
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
 def _bc_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, list[str]]]:
     """Build the count_only query list: (feature_type, class, value, filters).
 
@@ -508,18 +543,19 @@ def run_bc_conditional_queries(
 
     def run_query(q):
         f_type, r_class, val, filters = q
-        count = _count_only(client, org, dataset, schema, filters)
+        count = _count_agg(client, org, dataset, schema, filters)
         return (f_type, r_class, val, count)
 
     base_cancer = None
     base_no_cancer = None
 
-    max_workers = 20
+    max_workers = 48
+    print(f"Running {len(queries)} queries with {max_workers} workers")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         cond_futures = [executor.submit(run_query, q) for q in queries]
         if include_base_rates:
-            f_cancer = executor.submit(_count_only, client, org, dataset, schema, ["cancer_5yr:1"])
-            f_no_cancer = executor.submit(_count_only, client, org, dataset, schema, ["cancer_5yr:0"])
+            f_cancer = executor.submit(_count_agg, client, org, dataset, schema, ["cancer_5yr:1"])
+            f_no_cancer = executor.submit(_count_agg, client, org, dataset, schema, ["cancer_5yr:0"])
         results = [f.result() for f in cond_futures]
         if include_base_rates:
             base_cancer = f_cancer.result()
@@ -545,8 +581,8 @@ def get_bc_base_rates(
     schema: str,
 ) -> tuple[int, int]:
     """Query BI for cancer / no-cancer counts (serial fallback)."""
-    n_cancer = _count_only(client, org, dataset, schema, ["cancer_5yr:1"])
-    n_no_cancer = _count_only(client, org, dataset, schema, ["cancer_5yr:0"])
+    n_cancer = _count_agg(client, org, dataset, schema, ["cancer_5yr:1"])
+    n_no_cancer = _count_agg(client, org, dataset, schema, ["cancer_5yr:0"])
     return n_cancer, n_no_cancer
 
 
@@ -689,11 +725,14 @@ def _build_bc_dt_count_provider(
                 except Exception as fallback_exc:
                     raise RuntimeError(f"BI aggregate count failed for filters={filters!r}") from fallback_exc
             else:
+                # count->aggregate: prefer the class-count aggregate (one round-trip,
+                # no depth-4/422 ceiling); fall back to count_only for the few filter
+                # shapes aggregate can't express (e.g. range-bin + equality combos).
                 try:
-                    aggregate_cache[key] = _count_only(client, org, dataset, schema, filters)
+                    aggregate_cache[key] = _count_agg(client, org, dataset, schema, filters)
                 except Exception:
                     try:
-                        aggregate_cache[key] = _count_via_class_aggregate(client, org, dataset, schema, filters)
+                        aggregate_cache[key] = _count_only(client, org, dataset, schema, filters)
                         fallback_counter["n"] += 1
                     except Exception as fallback_exc:
                         raise RuntimeError(f"BI aggregate count failed for filters={filters!r}") from fallback_exc
@@ -842,7 +881,7 @@ def run_encrypted_dt_bc(
     k_min: int = 11,
     criterion: str = "gini",
     min_cell_size: int | None = None,
-    max_workers: int = 20,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Build a breast-cancer decision tree entirely from BI aggregate counts."""
     if not feature_values:
@@ -892,6 +931,7 @@ def run_encrypted_dt_bc(
         feature_values=dt_feature_values,
         n_pos=int(n_cancer),
         n_neg=int(n_no_cancer),
+        max_workers=max_workers,
     )
     if dt.tree is not None:
         dt.tree["bi_counts"] = True
@@ -1004,7 +1044,7 @@ def run_encrypted_rf_bc(
     criterion: str = "gini",
     k_min: int = CMS_MIN_CELL_SIZE,
     random_state: int | None = 42,
-    max_workers: int = 20,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train a breast-cancer Random Forest from BI aggregate counts only."""
     if not feature_values:
@@ -1069,6 +1109,7 @@ def run_encrypted_rf_bc(
         feature_values=rf_feature_values,
         n_pos=int(n_cancer),
         n_neg=int(n_no_cancer),
+        max_workers=max_workers,
     )
 
     additional_rf_queries = query_count()
@@ -1140,7 +1181,7 @@ def run_encrypted_adaboost_bc(
     n_estimators: int = 10,
     learning_rate: float = 1.0,
     k_min: int = CMS_MIN_CELL_SIZE,
-    max_workers: int = 20,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train BC AdaBoost decision stumps from BI aggregate counts only."""
     cache_source = rf_result or dt_result
@@ -1208,6 +1249,7 @@ def run_encrypted_adaboost_bc(
         feature_values=boost_feature_values,
         n_pos=int(n_cancer),
         n_neg=int(n_no_cancer),
+        max_workers=max_workers,
     )
 
     additional_adaboost_queries = query_count()
@@ -1383,7 +1425,7 @@ def run_encrypted_gnb_bc(
     var_smoothing: float = 1e-9,
     threshold: float = 0.5,
     min_cell_size: int = CMS_MIN_CELL_SIZE,
-    max_workers: int = 20,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train GaussianNaiveBayesModel from BI value-count aggregates only."""
     start = time.time()
@@ -1397,7 +1439,7 @@ def run_encrypted_gnb_bc(
 
     def run_query(q):
         feature, class_label, value, filters = q
-        count = _count_only(client, org, dataset, schema, filters)
+        count = _count_agg(client, org, dataset, schema, filters)
         return (feature, class_label, value, count)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1539,7 +1581,7 @@ def run_encrypted_bn_bc(
     alpha: float = 1.0,
     threshold: float = 0.5,
     min_cell_size: int = CMS_MIN_CELL_SIZE,
-    max_workers: int = 20,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train BayesianNetworkClassifierModel from BI CPT aggregate counts only."""
     start = time.time()
@@ -1554,7 +1596,7 @@ def run_encrypted_bn_bc(
 
     def run_query(query_tuple):
         feature, class_label, parent_state, value, filters = query_tuple
-        count = _count_only(client, org, dataset, schema, filters)
+        count = _count_agg(client, org, dataset, schema, filters)
         return (feature, class_label, parent_state, value, count)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2488,10 +2530,10 @@ def get_bc_demo_config() -> dict[str, Any]:
     """Centralized notebook config for the breast-cancer demo."""
     return {
         "dataset": "breast-cancer-screening-data",
-        "schema": "train",
-        "test_schema": "test",
-        "sqlite_db": "demo_data/plaintext/bc_train.db",
-        "test_sqlite_db": "demo_data/plaintext/bc_test.db",
+        "schema": "bc-train",
+        "test_schema": "bc-test",
+        "sqlite_db": "../demo-datasets/datasets/breast-cancer/sqlite/bc_train_270k.db",
+        "test_sqlite_db": "../demo-datasets/datasets/breast-cancer/sqlite/bc_test.db",
         "nb_features": [
             "age_group",
             "race_ethnicity",
