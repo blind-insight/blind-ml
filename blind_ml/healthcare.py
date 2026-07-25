@@ -478,21 +478,28 @@ def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
     ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
     if len(ranges) >= 2:
         # A two-range cell can't be a single aggregate, so it needs count_only --
-        # which is slow and flaky under load. But most such cells are deep and
-        # suppressed, so check a cheap aggregate SUPERSET upper bound first (drop one
-        # range -> single-range aggregate, reliable; true count <= superset):
-        #   superset < k_min  -> cell is provably suppressed -> 0 (skip count_only)
-        #   superset >= k_min -> cell may be populated -> exact count via count_only
-        # This keeps populated cells exact while avoiding a count_only retry storm on
-        # the sparse majority.
-        superset = [f for f in filters if f != ranges[0]]
+        # slow and flaky under load. Most such cells are deep and suppressed, so
+        # first try to PROVE suppression cheaply: dropping EITHER range gives an
+        # aggregate-able superset (true count <= superset). If any superset is
+        # < k_min the cell is suppressed -> return 0 without touching count_only.
+        for rf in ranges:
+            sub = [f for f in filters if f != rf]
+            try:
+                if _count_agg(client, org, dataset, schema, sub, retries=retries) < CMS_MIN_CELL_SIZE:
+                    return 0
+            except Exception:
+                pass
+        # Not provably suppressed -> the cell may be populated, so get the exact
+        # count via count_only. If it persistently fails (flaky under load) fall back
+        # to 0 with a loud warning rather than crash a long training run.
         try:
-            upper = _count_agg(client, org, dataset, schema, superset, retries=retries)
+            return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
         except Exception:
-            upper = None
-        if upper is not None and upper < CMS_MIN_CELL_SIZE:
+            print(
+                f"WARNING: count_only failed for multi-range {filters!r} that is not provably "
+                "suppressed; treating as 0 -- inspect if this cell may be populated."
+            )
             return 0
-        return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
 
     # Prefer a range filter as the count() target; else the class filter.
     target_idx = None
