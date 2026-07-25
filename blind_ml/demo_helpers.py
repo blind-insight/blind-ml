@@ -951,8 +951,6 @@ def run_bi_training(
         count = get_encrypted_count(client, org, dataset, schema, q_str)
         return (f_type, r_class, val, count)
 
-    # Single executor over all queries (no sequential batch barriers); peak
-    # concurrency is bounded by max_workers, so batching only added latency.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(run_query, queries))
 
@@ -1801,7 +1799,7 @@ def run_encrypted_dt_fraud(
     max_depth: int = 3,
     k_min: int = 0,
     criterion: str = "gini",
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Build a fraud decision tree entirely from encrypted aggregate counts."""
     if not feature_values:
@@ -1847,6 +1845,7 @@ def run_encrypted_dt_fraud(
         feature_values=dt_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
     )
     if dt.tree is not None:
         dt.tree["bi_counts"] = True
@@ -1975,7 +1974,7 @@ def _run_fraud_marginal_queries(
     dataset: str,
     schema: str,
     feature_values: dict[str, list[str]],
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> list[tuple]:
     """Fetch fraud class-split marginal counts from BI."""
     queries = _bi_queries(feature_values)
@@ -2005,7 +2004,7 @@ def run_encrypted_rf_fraud(
     org: str | None = None,
     dataset: str | None = None,
     schema: str | None = None,
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train a fraud Random Forest from encrypted aggregate counts.
 
@@ -2072,6 +2071,7 @@ def run_encrypted_rf_fraud(
         feature_values=rf_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
     )
 
     additional_rf_queries = query_count()
@@ -2192,7 +2192,8 @@ def run_encrypted_adaboost_fraud(
     org: str | None = None,
     dataset: str | None = None,
     schema: str | None = None,
-    max_workers: int = 10,
+    max_workers: int = 48,
+    max_regions: int | None = None,
 ) -> dict[str, Any]:
     """Train fraud AdaBoost stumps from encrypted aggregate counts.
 
@@ -2264,6 +2265,8 @@ def run_encrypted_adaboost_fraud(
         feature_values=boost_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
+        max_regions=max_regions,
     )
 
     additional_adaboost_queries = query_count()
@@ -2642,9 +2645,7 @@ def run_encrypted_gnb_fraud(
         count = get_encrypted_count(client, org, dataset, schema, query)
         return (feature, class_label, value, count)
 
-    # Single executor over all queries: peak concurrency is bounded by
-    # max_workers regardless, so the old 3-batch split only added sequential
-    # barriers (each batch waited for its slowest query). One wave is faster.
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         raw_results = list(executor.map(run_query, queries))
 
@@ -2823,9 +2824,6 @@ def run_encrypted_bn_fraud(
         count = get_encrypted_count(client, org, dataset, schema, query)
         return (feature, class_label, parent_state, value, count)
 
-    # Single executor over all queries: peak concurrency is bounded by
-    # max_workers regardless, so the old 3-batch split only added sequential
-    # barriers (each batch waited for its slowest query). One wave is faster.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         raw_results = list(executor.map(run_query, queries))
 
@@ -2979,9 +2977,6 @@ def run_encrypted_histogram_fraud(
         count = get_encrypted_count(client, org, dataset, schema, q_str)
         return (f_type, r_class, val, count)
 
-    # Single executor over all queries: peak concurrency is bounded by
-    # max_workers regardless, so the old 3-batch split only added sequential
-    # barriers (each batch waited for its slowest query). One wave is faster.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         raw_results = list(executor.map(run_query, queries))
 
