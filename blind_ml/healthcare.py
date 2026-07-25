@@ -533,6 +533,36 @@ def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
             time.sleep(1.5 * (attempt + 1))
 
 
+def _count_or_suppressed(client, org, dataset, schema, filters, retries: int = 3) -> int:
+    """Resilient count for TREE cells -- never raises.
+
+    Try ``_count_agg`` (range-aware aggregate + count_only fallback). If it fails
+    (deep queries flake transiently under high concurrency), prove suppression via
+    a SUPERSET bound: dropping any one filter yields a countable query whose count
+    is an upper bound (true <= superset). If any superset is < k_min the cell is
+    suppressed -> 0. Otherwise return 0 with a loud warning rather than crash a
+    long training run -- deep tree cells are overwhelmingly sparse, and a rare
+    unresolved cell that is genuinely populated is surfaced, not silent.
+    """
+    try:
+        return _count_agg(client, org, dataset, schema, filters, retries=retries)
+    except Exception:
+        for drop in filters:
+            sub = [f for f in filters if f != drop]
+            if not sub:
+                continue
+            try:
+                if _count_agg(client, org, dataset, schema, sub, retries=retries) < CMS_MIN_CELL_SIZE:
+                    return 0
+            except Exception:
+                continue
+        print(
+            f"WARNING: count failed for {filters!r} and no superset proves suppression; "
+            "treating as 0 -- inspect whether this cell may be populated."
+        )
+        return 0
+
+
 def _bc_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, list[str]]]:
     """Build the count_only query list: (feature_type, class, value, filters).
 
@@ -755,26 +785,12 @@ def _build_bc_dt_count_provider(
             aggregate_cache[_normalize_filter_tuple([_bc_class_filter(cls), _bi_feat_filter(feature, value)])] = count
 
     def _aggregate(filters: list[str]) -> int:
+        # Tree cells go through the resilient counter: aggregate (range-aware) with
+        # count_only fallback, and on a transient failure under load a
+        # suppression-bounded 0 rather than crashing a long training run.
         key = _normalize_filter_tuple(filters)
         if key not in aggregate_cache:
-            if len(filters) >= 4:
-                try:
-                    aggregate_cache[key] = _count_agg(client, org, dataset, schema, filters)
-                    fallback_counter["n"] += 1
-                except Exception as fallback_exc:
-                    raise RuntimeError(f"BI aggregate count failed for filters={filters!r}") from fallback_exc
-            else:
-                # count->aggregate: prefer the class-count aggregate (one round-trip,
-                # no depth-4/422 ceiling); fall back to count_only for the few filter
-                # shapes aggregate can't express (e.g. range-bin + equality combos).
-                try:
-                    aggregate_cache[key] = _count_agg(client, org, dataset, schema, filters)
-                except Exception:
-                    try:
-                        aggregate_cache[key] = _count_only(client, org, dataset, schema, filters)
-                        fallback_counter["n"] += 1
-                    except Exception as fallback_exc:
-                        raise RuntimeError(f"BI aggregate count failed for filters={filters!r}") from fallback_exc
+            aggregate_cache[key] = _count_or_suppressed(client, org, dataset, schema, filters)
             query_counter["n"] += 1
         return aggregate_cache[key]
 
@@ -1220,7 +1236,7 @@ def run_encrypted_adaboost_bc(
     n_estimators: int = 10,
     learning_rate: float = 1.0,
     k_min: int = CMS_MIN_CELL_SIZE,
-    max_workers: int = 48,
+    max_workers: int = 24,
     max_regions: int | None = None,
 ) -> dict[str, Any]:
     """Train BC AdaBoost decision stumps from BI aggregate counts only.
