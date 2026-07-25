@@ -477,31 +477,22 @@ def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
     # flaky under high concurrency, so retry hard.
     ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
     if len(ranges) >= 2:
+        # A two-range cell can't be a single aggregate, so it needs count_only --
+        # which is slow and flaky under load. But most such cells are deep and
+        # suppressed, so check a cheap aggregate SUPERSET upper bound first (drop one
+        # range -> single-range aggregate, reliable; true count <= superset):
+        #   superset < k_min  -> cell is provably suppressed -> 0 (skip count_only)
+        #   superset >= k_min -> cell may be populated -> exact count via count_only
+        # This keeps populated cells exact while avoiding a count_only retry storm on
+        # the sparse majority.
+        superset = [f for f in filters if f != ranges[0]]
         try:
-            return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
-        except Exception as count_exc:
-            # count_only is genuinely failing. Only substitute 0 if we can PROVE the
-            # cell is below the suppression floor: drop one range to get an
-            # aggregate-able SUPERSET (true count <= superset). If that superset is
-            # already < k_min the true cell is suppressed anyway, so 0 is safe;
-            # otherwise the cell may be populated (large dataset) -- surface the
-            # failure instead of silently undercounting to 0.
-            superset = [f for f in filters if f != ranges[0]]
-            try:
-                upper = _count_agg(client, org, dataset, schema, superset, retries=retries)
-            except Exception:
-                upper = None
-            if upper is not None and upper < CMS_MIN_CELL_SIZE:
-                print(
-                    f"WARNING: count_only failed for multi-range {filters!r}; superset "
-                    f"upper-bound={upper} < k_min={CMS_MIN_CELL_SIZE}, treating as 0 (suppressed)."
-                )
-                return 0
-            raise RuntimeError(
-                f"count_only failed for multi-range filters {filters!r} and the cell is not "
-                f"provably below the suppression floor (superset upper-bound="
-                f"{'unknown' if upper is None else upper}); refusing to substitute 0."
-            ) from count_exc
+            upper = _count_agg(client, org, dataset, schema, superset, retries=retries)
+        except Exception:
+            upper = None
+        if upper is not None and upper < CMS_MIN_CELL_SIZE:
+            return 0
+        return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
 
     # Prefer a range filter as the count() target; else the class filter.
     target_idx = None
