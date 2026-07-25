@@ -474,18 +474,34 @@ def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
     # Aggregate accepts only ONE range (the count() target) and no range as an
     # equality extra_filter, so a path with two+ range bins can't be a single
     # aggregate. count_only counts these correctly (verified vs plaintext) but is
-    # flaky under high concurrency, so retry hard; these paths are deep and sparse
-    # (k_min-suppressed), so on a persistent failure treat as 0 rather than crash.
+    # flaky under high concurrency, so retry hard.
     ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
     if len(ranges) >= 2:
         try:
             return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
-        except Exception:
-            print(
-                f"WARNING: count_only failed for multi-range filters {filters!r}; "
-                "treating as 0 (deep sparse cell, k_min-suppressed)."
-            )
-            return 0
+        except Exception as count_exc:
+            # count_only is genuinely failing. Only substitute 0 if we can PROVE the
+            # cell is below the suppression floor: drop one range to get an
+            # aggregate-able SUPERSET (true count <= superset). If that superset is
+            # already < k_min the true cell is suppressed anyway, so 0 is safe;
+            # otherwise the cell may be populated (large dataset) -- surface the
+            # failure instead of silently undercounting to 0.
+            superset = [f for f in filters if f != ranges[0]]
+            try:
+                upper = _count_agg(client, org, dataset, schema, superset, retries=retries)
+            except Exception:
+                upper = None
+            if upper is not None and upper < CMS_MIN_CELL_SIZE:
+                print(
+                    f"WARNING: count_only failed for multi-range {filters!r}; superset "
+                    f"upper-bound={upper} < k_min={CMS_MIN_CELL_SIZE}, treating as 0 (suppressed)."
+                )
+                return 0
+            raise RuntimeError(
+                f"count_only failed for multi-range filters {filters!r} and the cell is not "
+                f"provably below the suppression floor (superset upper-bound="
+                f"{'unknown' if upper is None else upper}); refusing to substitute 0."
+            ) from count_exc
 
     # Prefer a range filter as the count() target; else the class filter.
     target_idx = None
