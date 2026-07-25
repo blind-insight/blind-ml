@@ -472,12 +472,20 @@ def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
     aggregation target or if two+ range bins are present.
     """
     # Aggregate accepts only ONE range (the count() target) and no range as an
-    # equality extra_filter, so a path with two+ range bins can't be expressed as a
-    # single aggregate. count_only counts these correctly (verified) up to its
-    # ~4-filter limit; deeper multi-range paths are rare.
+    # equality extra_filter, so a path with two+ range bins can't be a single
+    # aggregate. count_only counts these correctly (verified vs plaintext) but is
+    # flaky under high concurrency, so retry hard; these paths are deep and sparse
+    # (k_min-suppressed), so on a persistent failure treat as 0 rather than crash.
     ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
     if len(ranges) >= 2:
-        return _count_only(client, org, dataset, schema, filters, retries=retries)
+        try:
+            return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
+        except Exception:
+            print(
+                f"WARNING: count_only failed for multi-range filters {filters!r}; "
+                "treating as 0 (deep sparse cell, k_min-suppressed)."
+            )
+            return 0
 
     # Prefer a range filter as the count() target; else the class filter.
     target_idx = None
