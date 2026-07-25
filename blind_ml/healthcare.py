@@ -460,24 +460,41 @@ def _count_via_class_aggregate(client, org, dataset, schema, filters: list[str],
 
 
 def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
-    """Drop-in replacement for ``_count_only`` using the class-count aggregate path.
+    """Drop-in replacement for ``_count_only`` using the aggregate path.
 
-    Expresses the ``cancer_5yr`` class filter as ``cancer_5yr:count(<value>)`` and
-    sends the remaining equality filters as ``extra_filters``. Returns the same int
-    count as ``_count_only`` but in ONE POST (vs count_only's two round-trips) and
-    with no depth-4 / HTTP-422 ceiling. If no class filter is present it falls back
-    to ``_count_only`` (nothing to aggregate on).
+    Picks one filter to be the ``field:count(<value>)`` aggregation target and
+    sends the rest as equality ``extra_filters``. A RANGE-bin filter (value
+    contains ``~``, e.g. ``age_at_first_birth:30~47``) is preferred as the target
+    because the aggregate endpoint supports ranges INSIDE ``count()`` but not as an
+    equality extra_filter; otherwise the ``cancer_5yr`` class filter is the target.
+    Returns the same int count as ``_count_only`` but in ONE POST and with no
+    depth-4 / HTTP-422 ceiling. Falls back to ``_count_only`` if there is no usable
+    aggregation target or if two+ range bins are present.
     """
-    class_value = None
-    extra: list[str] = []
-    for f in filters:
-        if f in ("cancer_5yr:1", "cancer_5yr:0"):
-            class_value = f.split(":", 1)[1]
-        else:
-            extra.append(f)
-    if class_value is None:
+    # Aggregate accepts only ONE range (the count() target) and no range as an
+    # equality extra_filter, so a path with two+ range bins can't be expressed as a
+    # single aggregate. count_only counts these correctly (verified) up to its
+    # ~4-filter limit; deeper multi-range paths are rare.
+    ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
+    if len(ranges) >= 2:
         return _count_only(client, org, dataset, schema, filters, retries=retries)
-    agg_filter = f"cancer_5yr:count({class_value})"
+
+    # Prefer a range filter as the count() target; else the class filter.
+    target_idx = None
+    for i, f in enumerate(filters):
+        if ":" in f and "~" in f.split(":", 1)[1]:
+            target_idx = i
+            break
+    if target_idx is None:
+        for i, f in enumerate(filters):
+            if f in ("cancer_5yr:1", "cancer_5yr:0"):
+                target_idx = i
+                break
+    if target_idx is None:
+        return _count_only(client, org, dataset, schema, filters, retries=retries)
+    field, value = filters[target_idx].split(":", 1)
+    agg_filter = f"{field}:count({value})"
+    extra = [f for j, f in enumerate(filters) if j != target_idx]
     for attempt in range(retries):
         try:
             result = client.aggregate(
@@ -720,7 +737,7 @@ def _build_bc_dt_count_provider(
         if key not in aggregate_cache:
             if len(filters) >= 4:
                 try:
-                    aggregate_cache[key] = _count_via_class_aggregate(client, org, dataset, schema, filters)
+                    aggregate_cache[key] = _count_agg(client, org, dataset, schema, filters)
                     fallback_counter["n"] += 1
                 except Exception as fallback_exc:
                     raise RuntimeError(f"BI aggregate count failed for filters={filters!r}") from fallback_exc
