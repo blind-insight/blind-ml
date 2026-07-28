@@ -2645,7 +2645,6 @@ def run_encrypted_gnb_fraud(
         count = get_encrypted_count(client, org, dataset, schema, query)
         return (feature, class_label, value, count)
 
-
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         raw_results = list(executor.map(run_query, queries))
 

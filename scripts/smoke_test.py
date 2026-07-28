@@ -173,7 +173,7 @@ def main() -> int:
         dh = importlib.import_module("blind_ml.demo_helpers")
         hc = importlib.import_module("blind_ml.healthcare")
         assert dh.get_fraud_demo_config()["dataset"]
-        assert hc.get_bc_demo_config()["schema"] == "train"
+        assert hc.get_bc_demo_config()["schema"] == "bc-train"
         assert hc.load_env is dh.load_env
 
     check("demo configs + load_env re-export", demo_configs)
