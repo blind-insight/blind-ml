@@ -30,9 +30,6 @@ from .demo_helpers import (
     metrics_table,
 )
 from .models import (
-    AdaBoostStumpModel as _AdaBoostStumpModel,
-)
-from .models import (
     BayesianNetworkClassifierModel as _BayesianNetworkClassifierModel,
 )
 from .models import (
@@ -1079,7 +1076,7 @@ encrypted_dt_describe = bc_dt_describe
 
 
 # ============================================================================
-# Encrypted Random Forest and AdaBoost from aggregate counts
+# Encrypted Random Forest from aggregate counts
 # ============================================================================
 
 
@@ -1219,152 +1216,6 @@ def bc_rf_describe(rf_result: dict, max_trees: int = 3) -> str:
         lines.append(bc_dt_describe({"_model": tree}))
     if len(model.estimators_) > max_trees:
         lines.append(f"\n... {len(model.estimators_) - max_trees} more trees")
-    return "\n".join(lines)
-
-
-def run_encrypted_adaboost_bc(
-    client,
-    org: str,
-    dataset: str,
-    schema: str,
-    feature_values: dict[str, list[str]] | None = None,
-    dt_result: dict | None = None,
-    rf_result: dict | None = None,
-    raw_results: list[tuple] | None = None,
-    n_cancer: int | None = None,
-    n_no_cancer: int | None = None,
-    n_estimators: int = 10,
-    learning_rate: float = 1.0,
-    k_min: int = CMS_MIN_CELL_SIZE,
-    max_workers: int = 24,
-    max_regions: int | None = None,
-) -> dict[str, Any]:
-    """Train BC AdaBoost decision stumps from BI aggregate counts only.
-
-    max_regions: PROTOTYPE region pruning (default None = exact). Caps the
-    boosting partition to the top-N regions by weight each round to bound the
-    per-round query explosion; approximate. See AdaBoostStumpModel.fit_from_counts.
-    """
-    cache_source = rf_result or dt_result
-    if not feature_values:
-        if cache_source and cache_source.get("feature_values"):
-            feature_values = cache_source["feature_values"]
-        else:
-            raise ValueError("run_encrypted_adaboost_bc requires feature_values, rf_result, or dt_result.")
-    if client is None or not org or not dataset or not schema:
-        raise ValueError("run_encrypted_adaboost_bc requires BI client/org/dataset/schema.")
-
-    raw_results_source = "provided" if raw_results is not None else "adaboost_rerun"
-    base_rate_queries = 0
-    marginal_queries = 0
-    initial_cache: dict[tuple[str, ...], int] = {}
-
-    for candidate_source, source_name in ((rf_result, "rf_result"), (dt_result, "dt_result")):
-        if not candidate_source:
-            continue
-        if raw_results is None and candidate_source.get("raw_results") is not None:
-            raw_results = candidate_source["raw_results"]
-            raw_results_source = source_name
-        if n_cancer is None and candidate_source.get("n_cancer") is not None:
-            n_cancer = candidate_source["n_cancer"]
-        if n_no_cancer is None and candidate_source.get("n_no_cancer") is not None:
-            n_no_cancer = candidate_source["n_no_cancer"]
-        initial_cache.update(candidate_source.get("query_cache", {}))
-
-    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
-        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
-        base_rate_queries = 2
-    if raw_results is None:
-        raw = run_bc_conditional_queries(
-            client,
-            org,
-            dataset,
-            schema,
-            feature_values,
-            include_base_rates=False,
-            min_cell_size=max(0, int(k_min)),
-        )
-        raw_results = raw["raw_results"]
-        marginal_queries = len(raw_results)
-        raw_results_source = "adaboost_rerun"
-
-    reused_cache_entries = len(initial_cache)
-    count_fn, query_count, boost_feature_values, aggregate_cache, fallback_count = _build_bc_dt_count_provider(
-        client=client,
-        org=org,
-        dataset=dataset,
-        schema=schema,
-        feature_values=feature_values,
-        raw_results=raw_results,
-        aggregate_cache=initial_cache,
-        n_cancer=n_cancer,
-        n_no_cancer=n_no_cancer,
-    )
-
-    model = _AdaBoostStumpModel(
-        n_estimators=n_estimators,
-        learning_rate=learning_rate,
-        k_min=k_min,
-    ).fit_from_counts(
-        count_fn=count_fn,
-        feature_values=boost_feature_values,
-        n_pos=int(n_cancer),
-        n_neg=int(n_no_cancer),
-        max_workers=max_workers,
-        max_regions=max_regions,
-    )
-
-    additional_adaboost_queries = query_count()
-    enc_queries = marginal_queries + additional_adaboost_queries
-    return {
-        "_model": model,
-        "stumps": model.stumps_,
-        "feature_values": feature_values,
-        "raw_results": raw_results,
-        "raw_results_source": raw_results_source,
-        "query_cache": aggregate_cache,
-        "counts_from_bi": True,
-        "n_cancer": int(n_cancer),
-        "n_no_cancer": int(n_no_cancer),
-        "n_estimators": n_estimators,
-        "learning_rate": learning_rate,
-        "k_min": int(k_min),
-        "min_cell_size": int(k_min),
-        "train_time": model.train_time,
-        "enc_queries": enc_queries,
-        "base_rate_queries": base_rate_queries,
-        "marginal_queries": marginal_queries,
-        "additional_adaboost_queries": additional_adaboost_queries,
-        "fallback_aggregate_queries": fallback_count(),
-        "total_aggregate_calls": enc_queries + base_rate_queries,
-        "reused_cache_entries": reused_cache_entries,
-    }
-
-
-def bc_adaboost_predict(boost_result: dict, row: dict) -> tuple[int, float]:
-    """Predict using the encrypted BC AdaBoost model. Returns (pred, risk)."""
-    model = boost_result.get("_model")
-    if not model:
-        return 0, 0.0
-    return model.predict(_nb_features_from_row(row))
-
-
-def bc_adaboost_describe(boost_result: dict, max_stumps: int = 5) -> str:
-    """Return a compact text description of BC AdaBoost stumps."""
-    model = boost_result.get("_model")
-    if not model or not model.stumps_:
-        return "Empty AdaBoost model"
-
-    lines = [f"AdaBoost: {len(model.stumps_)} stumps, learning_rate={model.learning_rate}, threshold={model.threshold}"]
-    for idx, stump in enumerate(model.stumps_[:max_stumps], 1):
-        lines.append(
-            f"Stump {idx}: {stump['col_name']}? "
-            f"alpha={stump['alpha']:.4f}, error={stump['error']:.4f}, "
-            f"YES->{stump['left_pred']} (risk={stump['left_risk']:.3f}, n={stump['left_n']:,}), "
-            f"NO->{stump['right_pred']} (risk={stump['right_risk']:.3f}, n={stump['right_n']:,})"
-        )
-    if len(model.stumps_) > max_stumps:
-        lines.append(f"... {len(model.stumps_) - max_stumps} more stumps")
     return "\n".join(lines)
 
 
@@ -1862,50 +1713,6 @@ def bc_plaintext_rf_predict_proba(
     feature_values: dict[str, list[str]],
 ) -> list[float]:
     """Predict sklearn RandomForestClassifier P(cancer) for BC rows."""
-    return list(plaintext_predict_proba(model, col_names, df_test, feature_values, encoding="dt"))
-
-
-def train_plaintext_adaboost_bc(
-    df,
-    feature_values: dict[str, list[str]],
-    n_estimators: int = 10,
-    learning_rate: float = 1.0,
-    random_state: int = 42,
-) -> dict[str, Any]:
-    """Train a sklearn AdaBoostClassifier with decision stumps on plaintext BC features."""
-    from sklearn.ensemble import AdaBoostClassifier
-    from sklearn.tree import DecisionTreeClassifier
-
-    X_encoded, col_names = _bc_dt_one_hot(df)
-    y = df["cancer_5yr"].astype(int).values
-
-    start = time.time()
-    stump = DecisionTreeClassifier(max_depth=1, random_state=random_state)
-    try:
-        model = AdaBoostClassifier(
-            estimator=stump,
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            random_state=random_state,
-        )
-    except TypeError:
-        model = AdaBoostClassifier(
-            base_estimator=stump,
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            random_state=random_state,
-        )
-    model.fit(X_encoded, y)
-    return {"model": model, "train_time": time.time() - start, "col_names": col_names}
-
-
-def bc_plaintext_adaboost_predict_proba(
-    model,
-    col_names: list[str],
-    df_test,
-    feature_values: dict[str, list[str]],
-) -> list[float]:
-    """Predict sklearn AdaBoostClassifier P(cancer) for BC rows."""
     return list(plaintext_predict_proba(model, col_names, df_test, feature_values, encoding="dt"))
 
 
