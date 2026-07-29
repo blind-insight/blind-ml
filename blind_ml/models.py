@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from typing import Any
 
@@ -734,6 +735,7 @@ class DecisionTreeModel:
         feature_values: dict[str, list[str]],
         n_pos: int,
         n_neg: int,
+        max_workers: int = 1,
     ) -> DecisionTreeModel:
         """Build a binary CART tree from aggregate conditional counts.
 
@@ -809,6 +811,18 @@ class DecisionTreeModel:
 
             base_imp = imp_fn(n_pos_node, n_neg_node)
             best: tuple[float, str, str, int, str, int, int, int, int] | None = None
+
+            # Every candidate at this node issues independent aggregate queries;
+            # fetch them concurrently so the greedy scan below hits a warm cache.
+            # The reduction stays serial, so split selection is unchanged.
+            if max_workers > 1 and len(candidates) > 1:
+
+                def _warm(cand: tuple[str, str, int, str]) -> None:
+                    _count(path, cand[0], cand[1], 1)
+                    _count(path, cand[0], cand[1], 0)
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    list(executor.map(_warm, candidates))
 
             for feature, value, col_idx, col_name in candidates:
                 left_pos = _count(path, feature, value, 1)
@@ -949,6 +963,7 @@ class RandomForestModel:
         feature_values: dict[str, list[str]],
         n_pos: int,
         n_neg: int,
+        max_workers: int = 1,
     ) -> RandomForestModel:
         """Train an ensemble of count-backed decision trees.
 
@@ -991,6 +1006,7 @@ class RandomForestModel:
                 feature_values=subset_values,
                 n_pos=n_pos,
                 n_neg=n_neg,
+                max_workers=max_workers,
             )
             self.estimators_.append(tree)
             self.feature_subsets_.append(subset)
@@ -1057,8 +1073,19 @@ class AdaBoostStumpModel:
         feature_values: dict[str, list[str]],
         n_pos: int,
         n_neg: int,
+        max_workers: int = 1,
+        max_regions: int | None = None,
     ) -> AdaBoostStumpModel:
-        """Train weighted decision stumps from aggregate conditional counts."""
+        """Train weighted decision stumps from aggregate conditional counts.
+
+        max_regions : int | None
+            PROTOTYPE region pruning. AdaBoost's partition can nearly double each
+            round (every region splits), so per-round queries grow as
+            regions x candidates. When set, cap the partition to the top-N regions
+            by weight after each split, dropping the negligible tail. This bounds
+            the query explosion at the cost of a small approximation (dropped
+            regions no longer inform later stumps). Default None = exact.
+        """
         start = time.time()
         if not feature_values:
             raise ValueError("feature_values must contain at least one feature")
@@ -1117,6 +1144,24 @@ class AdaBoostStumpModel:
             total_weight = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in regions)
             if total_weight <= eps:
                 break
+
+            # Warm every (region, candidate, class) count for this round in
+            # parallel; the weighted-error scan below then reads a hot cache.
+            if max_workers > 1:
+                pending = [
+                    (region["path"], feature, value)
+                    for feature, value, _col_idx, _col_name in candidates
+                    if (feature, value) not in used_candidates
+                    for region in regions
+                ]
+                if len(pending) > 1:
+
+                    def _warm(item: tuple[tuple[tuple[str, str, bool], ...], str, str]) -> None:
+                        _count(item[0], item[1], item[2], 1)
+                        _count(item[0], item[1], item[2], 0)
+
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        list(executor.map(_warm, pending))
 
             for feature, value, col_idx, col_name in candidates:
                 if (feature, value) in used_candidates:
@@ -1217,6 +1262,15 @@ class AdaBoostStumpModel:
                             "w_neg": region["w_neg"] * neg_factor,
                         }
                     )
+
+            # PROTOTYPE region pruning: keep only the top-N regions by weight so
+            # the next round's query count stays bounded (regions x candidates).
+            if max_regions is not None and len(new_regions) > max_regions:
+                new_regions.sort(
+                    key=lambda r: r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"],
+                    reverse=True,
+                )
+                del new_regions[max_regions:]
 
             norm = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in new_regions)
             if norm <= eps:

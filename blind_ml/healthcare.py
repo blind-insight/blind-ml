@@ -16,6 +16,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations, product
 from typing import Any
 
 import numpy as np
@@ -29,10 +30,25 @@ from .demo_helpers import (
     metrics_table,
 )
 from .models import (
+    BayesianNetworkClassifierModel as _BayesianNetworkClassifierModel,
+)
+from .models import (
     DecisionTreeModel as _DecisionTreeModel,
 )
 from .models import (
+    GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
+)
+from .models import (
+    HistogramClassifierModel as _HistogramClassifierModel,
+)
+from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
+)
+from .models import (
+    RandomForestModel as _RandomForestModel,
+)
+from .models import (
+    build_bayesian_cpt_counts_local as _build_bayesian_cpt_counts_local,
 )
 from .models import (
     build_design_matrix as _build_design_matrix,
@@ -215,6 +231,10 @@ def bcsc_5yr_risk(row: dict[str, Any]) -> float:
 # Feature discovery (from local plaintext data)
 # ============================================================================
 
+# CMS cell suppression policy: exact aggregate cells with counts 1-10 should not
+# be reported or consumed as exact values in the healthcare demo.
+CMS_MIN_CELL_SIZE = 11
+
 NB_FEATURES = [
     "age_group",
     "race_ethnicity",
@@ -240,6 +260,40 @@ BIOPSY_BINS = [
     ("2", "num_prior_biopsies:2"),
     ("3_plus", "num_prior_biopsies:3~7"),
 ]
+
+_BC_STATIC_FEATURE_VALUES = {
+    "age_groups": ["40_49", "50_59", "60_69", "70_74"],
+    "race_values": ["asian_pi", "black", "hispanic", "other", "white"],
+    "relatives_values": ["0", "1", "2", "3", "4", "5"],
+    "biopsies_values": [b[0] for b in BIOPSY_BINS],
+    "atypical_values": ["no", "unknown", "yes"],
+    "menarche_values": ["12_13", "14_plus", "under_12"],
+    "density_values": ["1", "2", "3", "4"],
+    "afb_values": [b[0] for b in AFB_BINS],
+}
+
+_BC_GNB_DEFAULT_FEATURES = [
+    "age",
+    "age_at_menarche",
+    "age_at_first_birth",
+    "num_first_degree_relatives",
+    "num_prior_biopsies",
+    "breast_density",
+]
+
+_BC_GNB_VALUE_DOMAINS = {
+    "age": [str(v) for v in range(40, 77)],
+    "age_at_menarche": [str(v) for v in range(8, 20)],
+    "age_at_first_birth": [str(v) for v in range(0, 48)],
+    "num_first_degree_relatives": [str(v) for v in range(0, 6)],
+    "num_prior_biopsies": [str(v) for v in range(0, 8)],
+    "breast_density": [str(v) for v in range(1, 7)],
+}
+
+
+def get_bc_feature_values() -> dict[str, list[str]]:
+    """Return static breast-cancer feature domains for BI aggregate training."""
+    return {key: list(values) for key, values in _BC_STATIC_FEATURE_VALUES.items()}
 
 
 def _afb_bin(val) -> str:
@@ -280,6 +334,59 @@ def discover_feature_values(df) -> dict[str, list[str]]:
     }
 
 
+def _suppression_replacement(min_cell_size: int) -> int:
+    """Fixed deterministic replacement for suppressed nonzero cells."""
+    return max(1, int(min_cell_size) // 2)
+
+
+def _suppressed_cell_label(row: tuple) -> str:
+    """Human-readable label for a suppressed aggregate tuple."""
+    if len(row) >= 4:
+        return f"{row[0]}={row[2]}|class={row[1]}"
+    return repr(row)
+
+
+def suppress_bc_counts(
+    raw_results: list[tuple],
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
+) -> tuple[list[tuple], dict[str, Any]]:
+    """Apply CMS-style suppression to aggregate count tuples.
+
+    Count tuples are expected to store the aggregate count as their final item.
+    Exact zeroes stay zero, counts in [1, min_cell_size) are replaced with a
+    fixed midpoint estimate, and counts >= min_cell_size are preserved.
+    """
+    if min_cell_size <= 1:
+        return list(raw_results), {
+            "min_cell_size": min_cell_size,
+            "n_suppressed": 0,
+            "suppressed_cells": [],
+            "suppression_policy": "none",
+        }
+
+    replacement = _suppression_replacement(min_cell_size)
+    sanitized: list[tuple] = []
+    suppressed_cells: list[str] = []
+
+    for row in raw_results:
+        if not row:
+            sanitized.append(row)
+            continue
+        count = int(row[-1])
+        if 0 < count < min_cell_size:
+            sanitized.append((*row[:-1], replacement))
+            suppressed_cells.append(_suppressed_cell_label(row))
+        else:
+            sanitized.append(row)
+
+    return sanitized, {
+        "min_cell_size": min_cell_size,
+        "n_suppressed": len(suppressed_cells),
+        "suppressed_cells": suppressed_cells,
+        "suppression_policy": f"cms_k{min_cell_size}_fixed_midpoint_{replacement}",
+    }
+
+
 # ============================================================================
 # BI count_only queries for NB training (uses string filters, not integer ranges)
 # ============================================================================
@@ -302,6 +409,155 @@ def _count_only(client, org, dataset, schema, filters, retries=3):
             if attempt == retries - 1:
                 raise
             time.sleep(1.5 * (attempt + 1))
+
+
+def _bc_agg_value(resp) -> float:
+    """Extract a scalar aggregate value from BI aggregate responses."""
+    if isinstance(resp, list):
+        records = resp
+    else:
+        records = resp.get("records", []) if isinstance(resp, dict) else []
+    if not records:
+        return 0.0
+    first = records[0]
+    data = first.get("data", {}) if isinstance(first, dict) else {}
+    if isinstance(data, dict) and "value" in data:
+        value = data.get("value")
+        return float(value) if value is not None else 0.0
+    if isinstance(first, dict) and "value" in first:
+        value = first.get("value")
+        return float(value) if value is not None else 0.0
+    return 0.0
+
+
+def _count_via_class_aggregate(client, org, dataset, schema, filters: list[str], retries: int = 3) -> int:
+    """Fallback count for deep paths: aggregate the class field with path filters."""
+    if not filters:
+        return 0
+    class_filter = filters[0]
+    if class_filter not in ("cancer_5yr:1", "cancer_5yr:0"):
+        raise ValueError(f"BC aggregate fallback requires class-first filters, got {filters!r}")
+    class_value = class_filter.split(":", 1)[1]
+    agg_filter = f"cancer_5yr:count({class_value})"
+    extra_filters = list(filters[1:])
+    for attempt in range(retries):
+        try:
+            result = client.aggregate(
+                organization=org,
+                dataset_slug=dataset,
+                schema_slug=schema,
+                agg_filter=agg_filter,
+                extra_filters=extra_filters,
+            )
+            return int(_bc_agg_value(result))
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
+def _count_agg(client, org, dataset, schema, filters, retries: int = 3) -> int:
+    """Drop-in replacement for ``_count_only`` using the aggregate path.
+
+    Picks one filter to be the ``field:count(<value>)`` aggregation target and
+    sends the rest as equality ``extra_filters``. A RANGE-bin filter (value
+    contains ``~``, e.g. ``age_at_first_birth:30~47``) is preferred as the target
+    because the aggregate endpoint supports ranges INSIDE ``count()`` but not as an
+    equality extra_filter; otherwise the ``cancer_5yr`` class filter is the target.
+    Returns the same int count as ``_count_only`` but in ONE POST and with no
+    depth-4 / HTTP-422 ceiling. Falls back to ``_count_only`` if there is no usable
+    aggregation target or if two+ range bins are present.
+    """
+    # Aggregate accepts only ONE range (the count() target) and no range as an
+    # equality extra_filter, so a path with two+ range bins can't be a single
+    # aggregate. count_only counts these correctly (verified vs plaintext) but is
+    # flaky under high concurrency, so retry hard.
+    ranges = [f for f in filters if ":" in f and "~" in f.split(":", 1)[1]]
+    if len(ranges) >= 2:
+        # A two-range cell can't be a single aggregate, so it needs count_only --
+        # slow and flaky under load. Most such cells are deep and suppressed, so
+        # first try to PROVE suppression cheaply: dropping EITHER range gives an
+        # aggregate-able superset (true count <= superset). If any superset is
+        # < k_min the cell is suppressed -> return 0 without touching count_only.
+        for rf in ranges:
+            sub = [f for f in filters if f != rf]
+            try:
+                if _count_agg(client, org, dataset, schema, sub, retries=retries) < CMS_MIN_CELL_SIZE:
+                    return 0
+            except Exception:
+                pass
+        # Not provably suppressed -> the cell may be populated, so get the exact
+        # count via count_only. If it persistently fails (flaky under load) fall back
+        # to 0 with a loud warning rather than crash a long training run.
+        try:
+            return _count_only(client, org, dataset, schema, filters, retries=max(retries, 6))
+        except Exception:
+            print(
+                f"WARNING: count_only failed for multi-range {filters!r} that is not provably "
+                "suppressed; treating as 0 -- inspect if this cell may be populated."
+            )
+            return 0
+
+    # Prefer a range filter as the count() target; else the class filter.
+    target_idx = None
+    for i, f in enumerate(filters):
+        if ":" in f and "~" in f.split(":", 1)[1]:
+            target_idx = i
+            break
+    if target_idx is None:
+        for i, f in enumerate(filters):
+            if f in ("cancer_5yr:1", "cancer_5yr:0"):
+                target_idx = i
+                break
+    if target_idx is None:
+        return _count_only(client, org, dataset, schema, filters, retries=retries)
+    field, value = filters[target_idx].split(":", 1)
+    agg_filter = f"{field}:count({value})"
+    extra = [f for j, f in enumerate(filters) if j != target_idx]
+    for attempt in range(retries):
+        try:
+            result = client.aggregate(
+                organization=org,
+                dataset_slug=dataset,
+                schema_slug=schema,
+                agg_filter=agg_filter,
+                extra_filters=extra,
+            )
+            return int(_bc_agg_value(result))
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
+def _count_or_suppressed(client, org, dataset, schema, filters, retries: int = 3) -> int:
+    """Resilient count for TREE cells -- never raises.
+
+    Try ``_count_agg`` (range-aware aggregate + count_only fallback). If it fails
+    (deep queries flake transiently under high concurrency), prove suppression via
+    a SUPERSET bound: dropping any one filter yields a countable query whose count
+    is an upper bound (true <= superset). If any superset is < k_min the cell is
+    suppressed -> 0. Otherwise return 0 with a loud warning rather than crash a
+    long training run -- deep tree cells are overwhelmingly sparse, and a rare
+    unresolved cell that is genuinely populated is surfaced, not silent.
+    """
+    try:
+        return _count_agg(client, org, dataset, schema, filters, retries=retries)
+    except Exception:
+        for drop in filters:
+            sub = [f for f in filters if f != drop]
+            if not sub:
+                continue
+            try:
+                if _count_agg(client, org, dataset, schema, sub, retries=retries) < CMS_MIN_CELL_SIZE:
+                    return 0
+            except Exception:
+                continue
+        print(
+            f"WARNING: count failed for {filters!r} and no superset proves suppression; "
+            "treating as 0 -- inspect whether this cell may be populated."
+        )
+        return 0
 
 
 def _bc_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, list[str]]]:
@@ -341,6 +597,7 @@ def run_bc_conditional_queries(
     schema: str,
     values: dict[str, list[str]],
     include_base_rates: bool = True,
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
 ) -> dict[str, Any]:
     """Run count_only queries against BI using string filters.
 
@@ -352,24 +609,31 @@ def run_bc_conditional_queries(
 
     def run_query(q):
         f_type, r_class, val, filters = q
-        count = _count_only(client, org, dataset, schema, filters)
+        count = _count_agg(client, org, dataset, schema, filters)
         return (f_type, r_class, val, count)
 
     base_cancer = None
     base_no_cancer = None
 
-    max_workers = 20
+    max_workers = 48
+    print(f"Running {len(queries)} queries with {max_workers} workers")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         cond_futures = [executor.submit(run_query, q) for q in queries]
         if include_base_rates:
-            f_cancer = executor.submit(_count_only, client, org, dataset, schema, ["cancer_5yr:1"])
-            f_no_cancer = executor.submit(_count_only, client, org, dataset, schema, ["cancer_5yr:0"])
+            f_cancer = executor.submit(_count_agg, client, org, dataset, schema, ["cancer_5yr:1"])
+            f_no_cancer = executor.submit(_count_agg, client, org, dataset, schema, ["cancer_5yr:0"])
         results = [f.result() for f in cond_futures]
         if include_base_rates:
             base_cancer = f_cancer.result()
             base_no_cancer = f_no_cancer.result()
 
-    out = {"raw_results": results, "enc_queries": len(results)}
+    sanitized_results, suppression = suppress_bc_counts(results, min_cell_size=min_cell_size)
+    out = {
+        "raw_results": sanitized_results,
+        "raw_results_unsuppressed": results,
+        "enc_queries": len(results),
+        **suppression,
+    }
     if include_base_rates:
         out["n_cancer"] = base_cancer
         out["n_no_cancer"] = base_no_cancer
@@ -383,8 +647,8 @@ def get_bc_base_rates(
     schema: str,
 ) -> tuple[int, int]:
     """Query BI for cancer / no-cancer counts (serial fallback)."""
-    n_cancer = _count_only(client, org, dataset, schema, ["cancer_5yr:1"])
-    n_no_cancer = _count_only(client, org, dataset, schema, ["cancer_5yr:0"])
+    n_cancer = _count_agg(client, org, dataset, schema, ["cancer_5yr:1"])
+    n_no_cancer = _count_agg(client, org, dataset, schema, ["cancer_5yr:0"])
     return n_cancer, n_no_cancer
 
 
@@ -459,6 +723,185 @@ def _bi_feat_filter(feat_key: str, value: str) -> str:
 # _build_dt_targeted_queries removed -- replaced by blind_ml.DecisionTreeModel
 
 
+def _bc_dt_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return DecisionTreeModel feature values keyed by BC feature key."""
+    values_by_feature: dict[str, list[str]] = {}
+    for feature, (values_key, _field_name) in _FEATURE_MAP.items():
+        seen: set[str] = set()
+        values_by_feature[feature] = []
+        for raw_value in feature_values.get(values_key, []):
+            value = str(raw_value).lower()
+            if value in seen:
+                continue
+            seen.add(value)
+            values_by_feature[feature].append(value)
+    return values_by_feature
+
+
+def _bc_class_filter(class_label: int) -> str:
+    return "cancer_5yr:1" if int(class_label) == 1 else "cancer_5yr:0"
+
+
+def _normalize_filter_tuple(filters: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(str(f) for f in filters))
+
+
+def _build_bc_dt_count_provider(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    raw_results: list[tuple] | None = None,
+    aggregate_cache: dict[tuple[str, ...], int] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+):
+    """Create a DecisionTreeModel count_fn backed only by BI aggregates."""
+    dt_feature_values = _bc_dt_feature_values(feature_values)
+    aggregate_cache = aggregate_cache if aggregate_cache is not None else {}
+    split_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+    path_bound_cache: dict[tuple[tuple[tuple[str, str, bool], ...], int], int] = {}
+    query_counter = {"n": 0}
+    fallback_counter = {"n": 0}
+    class_totals = {}
+    if n_cancer is not None:
+        class_totals[1] = int(n_cancer)
+    if n_no_cancer is not None:
+        class_totals[0] = int(n_no_cancer)
+
+    if raw_results:
+        for feat_type, cls, raw_value, count in raw_results:
+            feature = str(feat_type)
+            if feature not in dt_feature_values:
+                continue
+            value = str(raw_value).lower()
+            count = int(count)
+            key = (tuple(), feature, value, int(cls))
+            split_cache[key] = count
+            aggregate_cache[_normalize_filter_tuple([_bc_class_filter(cls), _bi_feat_filter(feature, value)])] = count
+
+    def _aggregate(filters: list[str]) -> int:
+        # Tree cells go through the resilient counter: aggregate (range-aware) with
+        # count_only fallback, and on a transient failure under load a
+        # suppression-bounded 0 rather than crashing a long training run.
+        key = _normalize_filter_tuple(filters)
+        if key not in aggregate_cache:
+            aggregate_cache[key] = _count_or_suppressed(client, org, dataset, schema, filters)
+            query_counter["n"] += 1
+        return aggregate_cache[key]
+
+    def _allowed_values(path: tuple[tuple[str, str, bool], ...]) -> dict[str, set[str]]:
+        allowed = {feature: set(values) for feature, values in dt_feature_values.items()}
+        for feature, raw_value, branch in path:
+            if feature not in allowed:
+                return {}
+            value = str(raw_value).lower()
+            if branch:
+                allowed[feature] &= {value}
+            else:
+                allowed[feature].discard(value)
+        return allowed
+
+    def _path_constraints(
+        path: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[dict[str, str], list[tuple[str, str]], bool]:
+        equalities: dict[str, str] = {}
+        exclusions: list[tuple[str, str]] = []
+        for feature, raw_value, branch in path:
+            value = str(raw_value).lower()
+            if value not in dt_feature_values.get(feature, []):
+                return {}, [], False
+            if branch:
+                existing = equalities.get(feature)
+                if existing is not None and existing != value:
+                    return {}, [], False
+                equalities[feature] = value
+            else:
+                exclusions.append((feature, value))
+
+        for feature, value in exclusions:
+            if equalities.get(feature) == value:
+                return {}, [], False
+        return equalities, exclusions, True
+
+    def _query_count(equalities: dict[str, str], class_label: int) -> int:
+        filters = [_bc_class_filter(class_label)]
+        for feature in _FEATURE_MAP:
+            if feature in equalities:
+                filters.append(_bi_feat_filter(feature, equalities[feature]))
+        return _aggregate(filters)
+
+    def _count_with_exclusions(
+        equalities: dict[str, str],
+        exclusions: list[tuple[str, str]],
+        class_label: int,
+    ) -> int:
+        total = 0
+        for size in range(len(exclusions) + 1):
+            sign = -1 if size % 2 else 1
+            for subset in combinations(exclusions, size):
+                terms = dict(equalities)
+                impossible = False
+                for feature, value in subset:
+                    existing = terms.get(feature)
+                    if existing is not None and existing != value:
+                        impossible = True
+                        break
+                    terms[feature] = value
+                if impossible:
+                    continue
+                total += sign * _query_count(terms, class_label)
+        return max(0, total)
+
+    def _path_bound(path: tuple[tuple[str, str, bool], ...], class_label: int) -> int:
+        key = (path, int(class_label))
+        if key in path_bound_cache:
+            return path_bound_cache[key]
+        if not path:
+            total = class_totals.get(int(class_label))
+            if total is None:
+                total = _aggregate([_bc_class_filter(class_label)])
+            path_bound_cache[key] = int(total)
+            return int(total)
+
+        parent_path = path[:-1]
+        split_feature, split_value, branch = path[-1]
+        parent_total = _path_bound(parent_path, class_label)
+        equalities, exclusions, possible = _path_constraints(parent_path + ((split_feature, split_value, True),))
+        left_total = _count_with_exclusions(equalities, exclusions, class_label) if possible else 0
+        left_total = min(parent_total, max(0, int(left_total)))
+        total = left_total if branch else max(0, parent_total - left_total)
+        path_bound_cache[key] = total
+        return total
+
+    def count_fn(
+        path: tuple[tuple[str, str, bool], ...],
+        feature: str,
+        value: str,
+        class_label: int,
+    ) -> int:
+        norm_path = tuple((str(f), str(v).lower(), bool(branch)) for f, v, branch in path)
+        norm_value = str(value).lower()
+        key = (norm_path, str(feature), norm_value, int(class_label))
+        if key in split_cache:
+            return split_cache[key]
+
+        allowed = _allowed_values(norm_path + ((str(feature), norm_value, True),))
+        if not allowed or any(len(values) == 0 for values in allowed.values()):
+            split_cache[key] = 0
+            return 0
+
+        equalities, exclusions, possible = _path_constraints(norm_path + ((str(feature), norm_value, True),))
+        total = _count_with_exclusions(equalities, exclusions, class_label) if possible else 0
+        if norm_path:
+            total = min(total, _path_bound(norm_path, class_label))
+        split_cache[key] = total
+        return total
+
+    return count_fn, lambda: query_counter["n"], dt_feature_values, aggregate_cache, lambda: fallback_counter["n"]
+
+
 def _bc_feature_columns() -> list[str]:
     """Return ordered DataFrame column names for BC DT/LR features."""
     _bc = {"afb": "afb_bin", "biopsies": "biopsy_bin"}
@@ -477,56 +920,115 @@ def _prepare_bc_df(df_local):
     return df
 
 
-def run_encrypted_dt(
+def run_encrypted_dt_bc(
     client,
     org: str,
     dataset: str,
     schema: str,
-    raw_results: list[tuple[str, int, str, int]],
     feature_values: dict[str, list[str]],
-    df_local,
-    n_cancer: int,
-    n_no_cancer: int,
+    raw_results: list[tuple[str, int, str, int]] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    max_depth: int = 3,
     k_min: int = 11,
     criterion: str = "gini",
-    **kwargs,
+    min_cell_size: int | None = None,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
-    """Build binary CART DT via blind_ml with cell-suppression k_min."""
-    df = _prepare_bc_df(df_local)
-    feature_cols = _bc_feature_columns()
+    """Build a breast-cancer decision tree entirely from BI aggregate counts."""
+    if not feature_values:
+        raise ValueError("run_encrypted_dt_bc requires feature_values.")
+    if client is None or not org or not dataset or not schema:
+        raise ValueError("run_encrypted_dt_bc requires BI client/org/dataset/schema.")
 
-    dt = _DecisionTreeModel(max_depth=3, criterion=criterion, k_min=k_min)
-    dt.fit(df, feature_cols, "cancer_5yr")
+    start = time.time()
+    raw_results_source = "provided"
+    base_rate_queries = 0
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    if raw_results is None:
+        raw = run_bc_conditional_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            include_base_rates=False,
+            min_cell_size=min_cell_size if min_cell_size is not None else max(0, int(k_min)),
+        )
+        raw_results = raw["raw_results"]
+        raw_results_source = "dt_rerun"
+
+    if int(n_cancer) + int(n_no_cancer) == 0:
+        raise ValueError(
+            "run_encrypted_dt_bc requires non-zero BI base rates. "
+            "Got n_cancer=n_no_cancer=0 -- check that BI ingest completed."
+        )
+
+    count_fn, query_count, dt_feature_values, aggregate_cache, fallback_count = _build_bc_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        n_cancer=n_cancer,
+        n_no_cancer=n_no_cancer,
+    )
+    dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
+    dt.fit_from_counts(
+        count_fn=count_fn,
+        feature_values=dt_feature_values,
+        n_pos=int(n_cancer),
+        n_neg=int(n_no_cancer),
+        max_workers=max_workers,
+    )
+    if dt.tree is not None:
+        dt.tree["bi_counts"] = True
 
     return {
         "_model": dt,
+        "tree": dt.tree,
+        "col_names": dt.col_names,
+        "_col_set": dt._col_set,
+        "features": dt.feature_columns,
         "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
-        "root_ig": 0,
+        "root_gain": dt.tree.get("gain", 0) if dt.tree else 0,
+        "root_ig": dt.tree.get("gain", 0) if dt.tree else 0,
+        "root_from_bi": True,
+        "counts_from_bi": True,
         "root_children": {},
         "tree_nodes": {},
-        "enc_queries": 0,
-        "train_time": dt.train_time,
+        "enc_queries": len(raw_results) + query_count(),
+        "additional_dt_queries": query_count(),
+        "fallback_aggregate_queries": fallback_count(),
+        "base_rate_queries": base_rate_queries,
+        "total_aggregate_calls": len(raw_results) + query_count() + base_rate_queries,
+        "raw_results_source": raw_results_source,
+        "raw_results": raw_results,
+        "query_cache": aggregate_cache,
+        "train_time": time.time() - start,
         "d3_safe": 0,
         "d3_fallback": 0,
         "feature_values": feature_values,
+        "n_cancer": int(n_cancer),
+        "n_no_cancer": int(n_no_cancer),
+        "min_cell_size": int(k_min),
+        "criterion": criterion,
     }
 
 
-def encrypted_dt_predict(dt_result: dict, row: dict) -> tuple[int, float]:
+def bc_dt_predict(dt_result: dict, row: dict) -> tuple[int, float]:
     """Predict using the encrypted BC decision tree. Returns (pred, risk)."""
     model = dt_result.get("_model")
     if not model:
         return 0, 0.0
-    row_dict = dict(row)
-    row_dict["afb_bin"] = str(_afb_bin(row_dict.get("age_at_first_birth", "")))
-    row_dict["biopsy_bin"] = str(_biopsy_bin(row_dict.get("num_prior_biopsies", "")))
-    for col in _bc_feature_columns():
-        if col in row_dict:
-            row_dict[col] = str(row_dict[col]).lower()
-    return model.predict(row_dict)
+    return model.predict(_nb_features_from_row(row))
 
 
-def encrypted_dt_describe(dt_result: dict) -> str:
+def bc_dt_describe(dt_result: dict) -> str:
     """Return a text description of the binary CART tree."""
     model = dt_result.get("_model")
     if not model or not model.tree:
@@ -544,6 +1046,177 @@ def encrypted_dt_describe(dt_result: dict) -> str:
         return lines
 
     return "\n".join(_desc(model.tree))
+
+
+def run_encrypted_dt(*args, **kwargs) -> dict[str, Any]:
+    """Compatibility wrapper for the aggregate-only BC decision tree helper."""
+    if len(args) >= 9:
+        client, org, dataset, schema, raw_results, feature_values, _df_local, n_cancer, n_no_cancer, *rest = args
+        if rest:
+            kwargs.setdefault("k_min", rest[0])
+        if len(rest) > 1:
+            kwargs.setdefault("criterion", rest[1])
+        return run_encrypted_dt_bc(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values=feature_values,
+            raw_results=raw_results,
+            n_cancer=n_cancer,
+            n_no_cancer=n_no_cancer,
+            **kwargs,
+        )
+    kwargs.pop("df_local", None)
+    return run_encrypted_dt_bc(*args, **kwargs)
+
+
+encrypted_dt_predict = bc_dt_predict
+encrypted_dt_describe = bc_dt_describe
+
+
+# ============================================================================
+# Encrypted Random Forest from aggregate counts
+# ============================================================================
+
+
+def run_encrypted_rf_bc(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]] | None = None,
+    dt_result: dict | None = None,
+    raw_results: list[tuple] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    criterion: str = "gini",
+    k_min: int = CMS_MIN_CELL_SIZE,
+    random_state: int | None = 42,
+    max_workers: int = 48,
+) -> dict[str, Any]:
+    """Train a breast-cancer Random Forest from BI aggregate counts only."""
+    if not feature_values:
+        if dt_result and dt_result.get("feature_values"):
+            feature_values = dt_result["feature_values"]
+        else:
+            raise ValueError("run_encrypted_rf_bc requires feature_values or dt_result with feature_values.")
+    if client is None or not org or not dataset or not schema:
+        raise ValueError("run_encrypted_rf_bc requires BI client/org/dataset/schema.")
+
+    raw_results_source = "provided" if raw_results is not None else "rf_rerun"
+    base_rate_queries = 0
+    marginal_queries = 0
+    initial_cache: dict[tuple[str, ...], int] = {}
+
+    if dt_result:
+        raw_results = raw_results if raw_results is not None else dt_result.get("raw_results")
+        n_cancer = n_cancer if n_cancer is not None else dt_result.get("n_cancer")
+        n_no_cancer = n_no_cancer if n_no_cancer is not None else dt_result.get("n_no_cancer")
+        initial_cache = dict(dt_result.get("query_cache", {}))
+        raw_results_source = "dt_result" if raw_results is not None else raw_results_source
+
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        raw = run_bc_conditional_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            include_base_rates=False,
+            min_cell_size=max(0, int(k_min)),
+        )
+        raw_results = raw["raw_results"]
+        marginal_queries = len(raw_results)
+        raw_results_source = "rf_rerun"
+
+    reused_cache_entries = len(initial_cache)
+    count_fn, query_count, rf_feature_values, aggregate_cache, fallback_count = _build_bc_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        aggregate_cache=initial_cache,
+        n_cancer=n_cancer,
+        n_no_cancer=n_no_cancer,
+    )
+
+    model = _RandomForestModel(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        criterion=criterion,
+        k_min=k_min,
+        max_features=max_features,
+        random_state=random_state,
+    ).fit_from_counts(
+        count_fn=count_fn,
+        feature_values=rf_feature_values,
+        n_pos=int(n_cancer),
+        n_neg=int(n_no_cancer),
+        max_workers=max_workers,
+    )
+
+    additional_rf_queries = query_count()
+    enc_queries = marginal_queries + additional_rf_queries
+    return {
+        "_model": model,
+        "trees": [tree.tree for tree in model.estimators_],
+        "feature_subsets": model.feature_subsets_,
+        "feature_values": feature_values,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "query_cache": aggregate_cache,
+        "counts_from_bi": True,
+        "n_cancer": int(n_cancer),
+        "n_no_cancer": int(n_no_cancer),
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "max_features": max_features,
+        "criterion": criterion,
+        "k_min": int(k_min),
+        "min_cell_size": int(k_min),
+        "train_time": model.train_time,
+        "enc_queries": enc_queries,
+        "base_rate_queries": base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "additional_rf_queries": additional_rf_queries,
+        "fallback_aggregate_queries": fallback_count(),
+        "total_aggregate_calls": enc_queries + base_rate_queries,
+        "reused_cache_entries": reused_cache_entries,
+    }
+
+
+def bc_rf_predict(rf_result: dict, row: dict) -> tuple[int, float]:
+    """Predict using the encrypted BC Random Forest. Returns (pred, risk)."""
+    model = rf_result.get("_model")
+    if not model:
+        return 0, 0.0
+    return model.predict(_nb_features_from_row(row))
+
+
+def bc_rf_describe(rf_result: dict, max_trees: int = 3) -> str:
+    """Return a compact text description of the BC Random Forest."""
+    model = rf_result.get("_model")
+    if not model or not model.estimators_:
+        return "Empty forest"
+
+    lines = [
+        f"Random Forest: {len(model.estimators_)} trees, max_depth={model.max_depth}, max_features={model.max_features}"
+    ]
+    for idx, (tree, subset) in enumerate(zip(model.estimators_[:max_trees], model.feature_subsets_[:max_trees]), 1):
+        lines.append(f"\nTree {idx} features: {', '.join(subset)}")
+        lines.append(bc_dt_describe({"_model": tree}))
+    if len(model.estimators_) > max_trees:
+        lines.append(f"\n... {len(model.estimators_) - max_trees} more trees")
+    return "\n".join(lines)
 
 
 def run_bc_training(
@@ -607,6 +1280,348 @@ def train_plaintext_bc_nb(df, feature_values: dict[str, list[str]]) -> dict[str,
     }
 
 
+# ============================================================================
+# Gaussian Naive Bayes from encrypted value-count aggregates
+# ============================================================================
+
+
+def _bc_gnb_features(numeric_features: list[str] | None = None) -> list[str]:
+    """Resolve breast-cancer numeric/ordinal features for Gaussian NB."""
+    if numeric_features is None:
+        return list(_BC_GNB_DEFAULT_FEATURES)
+    unknown = [feature for feature in numeric_features if feature not in _BC_GNB_VALUE_DOMAINS]
+    if unknown:
+        raise ValueError(f"Unsupported GaussianNB breast-cancer features: {unknown}")
+    return list(numeric_features)
+
+
+def _bc_gnb_row_features(row: dict, numeric_features: list[str]) -> dict[str, float]:
+    """Extract numeric breast-cancer row features for Gaussian NB."""
+    return {feature: float(row.get(feature, 0)) for feature in numeric_features}
+
+
+def _bc_gnb_count_queries(numeric_features: list[str] | None = None) -> list[tuple[str, int, str, list[str]]]:
+    """Build class-split value-count queries for BC Gaussian NB summaries."""
+    queries: list[tuple[str, int, str, list[str]]] = []
+    for feature in _bc_gnb_features(numeric_features):
+        for value in _BC_GNB_VALUE_DOMAINS[feature]:
+            queries.append((feature, 1, value, ["cancer_5yr:1", f"{feature}:{value}"]))
+            queries.append((feature, 0, value, ["cancer_5yr:0", f"{feature}:{value}"]))
+    return queries
+
+
+def _bc_gnb_sufficient_stats(raw_results: list[tuple]) -> list[tuple[str, int, int, float, float]]:
+    """Convert class-split value counts into Gaussian sufficient statistics."""
+    accum: dict[tuple[str, int], dict[str, float]] = {}
+    for feature, class_label, raw_value, count in raw_results:
+        value = float(raw_value)
+        n = int(count)
+        stats = accum.setdefault((str(feature), int(class_label)), {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
+        stats["count"] += n
+        stats["sum"] += value * n
+        stats["sum_sq"] += value * value * n
+
+    return [
+        (feature, class_label, int(stats["count"]), stats["sum"], stats["sum_sq"])
+        for (feature, class_label), stats in sorted(accum.items())
+    ]
+
+
+def run_encrypted_gnb_bc(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    numeric_features: list[str] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    var_smoothing: float = 1e-9,
+    threshold: float = 0.5,
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
+    max_workers: int = 48,
+) -> dict[str, Any]:
+    """Train GaussianNaiveBayesModel from BI value-count aggregates only."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    features = _bc_gnb_features(numeric_features)
+    queries = _bc_gnb_count_queries(features)
+
+    def run_query(q):
+        feature, class_label, value, filters = q
+        count = _count_agg(client, org, dataset, schema, filters)
+        return (feature, class_label, value, count)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(run_query, queries))
+
+    sanitized_results, suppression = suppress_bc_counts(raw_results, min_cell_size=min_cell_size)
+    sufficient_stats = _bc_gnb_sufficient_stats(sanitized_results)
+    model = _GaussianNaiveBayesModel(
+        var_smoothing=var_smoothing,
+        threshold=threshold,
+    ).fit_from_sums(
+        sufficient_stats,
+        n_pos=int(n_cancer),
+        n_neg=int(n_no_cancer),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": sanitized_results,
+        "raw_results_unsuppressed": raw_results,
+        "sufficient_stats": sufficient_stats,
+        "features": features,
+        "n_cancer": int(n_cancer),
+        "n_no_cancer": int(n_no_cancer),
+        "n_total": int(n_cancer) + int(n_no_cancer),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "stat_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+        **suppression,
+    }
+
+
+def bc_gnb_predict(gnb_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with an encrypted BC Gaussian NB result. Returns (pred, risk)."""
+    model = gnb_result.get("_model")
+    features = gnb_result.get("features", _BC_GNB_DEFAULT_FEATURES)
+    if not model:
+        return 0, 0.0
+    return model.predict(_bc_gnb_row_features(row, features))
+
+
+def train_plaintext_gnb_bc(
+    df,
+    numeric_features: list[str] | None = None,
+    var_smoothing: float = 1e-9,
+) -> dict[str, Any]:
+    """Train sklearn GaussianNB on local plaintext breast-cancer features."""
+    from sklearn.naive_bayes import GaussianNB
+
+    start = time.time()
+    features = _bc_gnb_features(numeric_features)
+    X = df[features].apply(pd.to_numeric, errors="coerce")
+    if X.isnull().any().any():
+        bad_cols = X.columns[X.isnull().any()].tolist()
+        raise ValueError(f"GaussianNB breast-cancer features must be numeric and non-null: {bad_cols}")
+    y = df["cancer_5yr"].astype(int)
+
+    model = GaussianNB(var_smoothing=var_smoothing)
+    model.fit(X, y)
+    n_cancer = int(y.sum())
+    n_no_cancer = len(df) - n_cancer
+    return {
+        "model": model,
+        "features": features,
+        "n_cancer": n_cancer,
+        "n_no_cancer": n_no_cancer,
+        "n_total": n_cancer + n_no_cancer,
+        "train_time": time.time() - start,
+    }
+
+
+def bc_plaintext_gnb_predict_proba(model, feature_columns: list[str], df_test) -> list[float]:
+    """Predict sklearn GaussianNB P(cancer) for breast-cancer test rows."""
+    X = df_test[feature_columns].apply(pd.to_numeric, errors="coerce")
+    proba = model.predict_proba(X)
+    pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
+    return [float(p[pos_idx]) for p in proba]
+
+
+# ============================================================================
+# Bayesian Network from encrypted CPT aggregates
+# ============================================================================
+
+_BC_BN_PARENT_MAP = {
+    "age_group": [],
+    "race": [],
+    "relatives": [],
+    "biopsies": [],
+    "atypical": ["biopsies"],
+    "menarche": [],
+    "density": ["age_group"],
+    "afb": ["age_group"],
+}
+
+
+def _bc_bn_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map notebook feature-value config to BN feature keys."""
+    return {
+        feature: [str(value).lower() for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FEATURE_MAP.items()
+    }
+
+
+def _bc_bn_cpt_count_queries(
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+) -> list[tuple[str, int, tuple[tuple[str, str], ...], str, list[str]]]:
+    """Build BI count_only filters for breast-cancer Bayesian-network CPT cells."""
+    resolved_parent_map = parent_map or _BC_BN_PARENT_MAP
+    values_by_feature = _bc_bn_feature_values(feature_values)
+    queries: list[tuple[str, int, tuple[tuple[str, str], ...], str, list[str]]] = []
+
+    for feature in _FEATURE_MAP:
+        parents = resolved_parent_map.get(feature, [])
+        parent_value_lists = [values_by_feature.get(parent, []) for parent in parents]
+        parent_combos = list(product(*parent_value_lists)) if parent_value_lists else [tuple()]
+
+        for class_label in (1, 0):
+            class_filter = _bc_class_filter(class_label)
+            for parent_combo in parent_combos:
+                parent_state = tuple((parent, str(value).lower()) for parent, value in zip(parents, parent_combo))
+                parent_filters = [_bi_feat_filter(parent, str(value)) for parent, value in zip(parents, parent_combo)]
+                for value in values_by_feature.get(feature, []):
+                    filters = [class_filter, *parent_filters, _bi_feat_filter(feature, value)]
+                    queries.append((feature, class_label, parent_state, str(value).lower(), filters))
+    return queries
+
+
+def run_encrypted_bn_bc(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
+    max_workers: int = 48,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from BI CPT aggregate counts only."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    resolved_parent_map = parent_map or _BC_BN_PARENT_MAP
+    model_feature_values = _bc_bn_feature_values(feature_values)
+    queries = _bc_bn_cpt_count_queries(feature_values, resolved_parent_map)
+
+    def run_query(query_tuple):
+        feature, class_label, parent_state, value, filters = query_tuple
+        count = _count_agg(client, org, dataset, schema, filters)
+        return (feature, class_label, parent_state, value, count)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(run_query, queries))
+
+    sanitized_results, suppression = suppress_bc_counts(raw_results, min_cell_size=min_cell_size)
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        sanitized_results,
+        n_pos=int(n_cancer),
+        n_neg=int(n_no_cancer),
+        feature_values=model_feature_values,
+    )
+
+    return {
+        "_model": model,
+        "raw_results": sanitized_results,
+        "raw_results_unsuppressed": raw_results,
+        "parent_map": resolved_parent_map,
+        "feature_values": feature_values,
+        "n_cancer": int(n_cancer),
+        "n_no_cancer": int(n_no_cancer),
+        "n_total": int(n_cancer) + int(n_no_cancer),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "cpt_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+        **suppression,
+    }
+
+
+def _prepare_bc_bn_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Create BN feature-key columns from plaintext BC columns."""
+    df2 = df.copy()
+    df2["age_group"] = df2["age_group"].astype(str).str.lower()
+    df2["race"] = df2["race_ethnicity"].astype(str).str.lower()
+    df2["relatives"] = df2["num_first_degree_relatives"].astype(str).str.lower()
+    df2["biopsies"] = df2["num_prior_biopsies"].apply(_biopsy_bin).astype(str).str.lower()
+    df2["atypical"] = df2["atypical_hyperplasia"].astype(str).str.lower()
+    df2["menarche"] = df2["menarche_category"].astype(str).str.lower()
+    df2["density"] = df2["breast_density"].astype(str).str.lower()
+    df2["afb"] = df2["age_at_first_birth"].apply(_afb_bin).astype(str).str.lower()
+    df2["cancer_5yr"] = df2["cancer_5yr"].astype(int)
+    return df2
+
+
+def train_plaintext_bn_bc(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from local plaintext CPT counts."""
+    start = time.time()
+    resolved_parent_map = parent_map or _BC_BN_PARENT_MAP
+    df2 = _prepare_bc_bn_df(df)
+    model_feature_values = _bc_bn_feature_values(feature_values)
+    feature_keys = list(model_feature_values.keys())
+    cpt_counts = _build_bayesian_cpt_counts_local(
+        df2,
+        target_col="cancer_5yr",
+        feature_values=model_feature_values,
+        parent_map=resolved_parent_map,
+    )
+    n_cancer = int(df2["cancer_5yr"].sum())
+    n_no_cancer = len(df2) - n_cancer
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        cpt_counts,
+        n_pos=n_cancer,
+        n_neg=n_no_cancer,
+        feature_values={feature: model_feature_values[feature] for feature in feature_keys},
+    )
+
+    return {
+        "_model": model,
+        "raw_results": cpt_counts,
+        "parent_map": resolved_parent_map,
+        "n_cancer": n_cancer,
+        "n_no_cancer": n_no_cancer,
+        "n_total": n_cancer + n_no_cancer,
+        "train_time": time.time() - start,
+    }
+
+
+def bc_bn_predict(bn_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a BC BayesianNetworkClassifierModel. Returns (pred, risk)."""
+    model = bn_result.get("_model")
+    if model:
+        return model.predict(_nb_features_from_row(row))
+    return 0, 0.0
+
+
+def bc_plaintext_bn_predict_proba(
+    bn_result: dict,
+    df_test: pd.DataFrame,
+) -> list[float]:
+    """Predict plaintext Bayesian Network P(cancer) on breast-cancer rows."""
+    model = bn_result.get("_model")
+    if not model:
+        return [0.0 for _ in range(len(df_test))]
+    prepared = _prepare_bc_bn_df(df_test)
+    return [float(model.predict(row.to_dict())[1]) for _, row in prepared.iterrows()]
+
+
 def _bc_one_hot_encode(df, feature_values: dict[str, list[str]]):
     """One-hot encode BC features into a numpy design matrix.
 
@@ -665,6 +1680,205 @@ def train_plaintext_bc_dt(df, feature_values: dict[str, list[str]], max_depth: i
     return {"model": model, "train_time": train_time, "col_names": col_names}
 
 
+def train_plaintext_rf_bc(
+    df,
+    feature_values: dict[str, list[str]],
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a sklearn RandomForestClassifier on local plaintext BC features."""
+    from sklearn.ensemble import RandomForestClassifier
+
+    X_encoded, col_names = _bc_dt_one_hot(df)
+    y = df["cancer_5yr"].astype(int).values
+
+    start = time.time()
+    sklearn_max_features = None if max_features == "all" else max_features
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        max_features=sklearn_max_features,
+        random_state=random_state,
+    )
+    model.fit(X_encoded, y)
+    return {"model": model, "train_time": time.time() - start, "col_names": col_names}
+
+
+def bc_plaintext_rf_predict_proba(
+    model,
+    col_names: list[str],
+    df_test,
+    feature_values: dict[str, list[str]],
+) -> list[float]:
+    """Predict sklearn RandomForestClassifier P(cancer) for BC rows."""
+    return list(plaintext_predict_proba(model, col_names, df_test, feature_values, encoding="dt"))
+
+
+def _bc_histogram_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map notebook feature-value config to HistogramClassifierModel keys."""
+    return {
+        feature: [str(value).lower() for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FEATURE_MAP.items()
+    }
+
+
+def run_encrypted_histogram_bc(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    bi_raw: dict[str, Any] | None = None,
+    raw_results: list[tuple] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    alpha: float = 1.0,
+    threshold: float | None = None,
+    use_feature_weights: bool = True,
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from BI class-split marginal counts only."""
+    start = time.time()
+    bi_raw = bi_raw or {}
+    raw_results_source = "provided"
+    base_rate_queries = 0
+    marginal_queries = 0
+    raw_results_unsuppressed = None
+
+    if raw_results is None:
+        raw_results = bi_raw.get("raw_results")
+        raw_results_source = "bi_raw" if raw_results is not None else "rerun"
+
+    if n_cancer is None:
+        n_cancer = bi_raw.get("n_cancer")
+    if n_no_cancer is None:
+        n_no_cancer = bi_raw.get("n_no_cancer")
+
+    suppression = {
+        "min_cell_size": min_cell_size,
+        "n_suppressed": int(bi_raw.get("n_suppressed", 0)) if raw_results_source == "bi_raw" else 0,
+        "suppressed_cells": list(bi_raw.get("suppressed_cells", [])) if raw_results_source == "bi_raw" else [],
+        "suppression_policy": bi_raw.get(
+            "suppression_policy",
+            "none"
+            if min_cell_size <= 1
+            else f"cms_k{min_cell_size}_fixed_midpoint_{_suppression_replacement(min_cell_size)}",
+        ),
+    }
+
+    if raw_results is None:
+        rerun = run_bc_conditional_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            include_base_rates=n_cancer is None or n_no_cancer is None,
+            min_cell_size=min_cell_size,
+        )
+        raw_results = rerun["raw_results"]
+        raw_results_unsuppressed = rerun.get("raw_results_unsuppressed")
+        marginal_queries = int(rerun.get("enc_queries", 0))
+        suppression = {
+            "min_cell_size": int(rerun.get("min_cell_size", min_cell_size)),
+            "n_suppressed": int(rerun.get("n_suppressed", 0)),
+            "suppressed_cells": list(rerun.get("suppressed_cells", [])),
+            "suppression_policy": rerun.get("suppression_policy", "none"),
+        }
+        if n_cancer is None:
+            n_cancer = rerun.get("n_cancer")
+        if n_no_cancer is None:
+            n_no_cancer = rerun.get("n_no_cancer")
+    elif raw_results_source == "provided":
+        raw_results_unsuppressed = list(raw_results)
+        raw_results, suppression = suppress_bc_counts(raw_results, min_cell_size=min_cell_size)
+
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    n_cancer = int(n_cancer)
+    n_no_cancer = int(n_no_cancer)
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=n_cancer,
+        n_neg=n_no_cancer,
+        feature_values=_bc_histogram_feature_values(feature_values),
+    )
+
+    result = {
+        "_model": model,
+        "counts_from_bi": True,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "enc_queries": marginal_queries + base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "base_rate_queries": base_rate_queries,
+        "n_cancer": n_cancer,
+        "n_no_cancer": n_no_cancer,
+        "n_total": n_cancer + n_no_cancer,
+        "train_time": time.time() - start,
+        **suppression,
+    }
+    if raw_results_unsuppressed is not None:
+        result["raw_results_unsuppressed"] = raw_results_unsuppressed
+    return result
+
+
+def bc_histogram_predict(hist_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a BC HistogramClassifierModel. Returns (pred, risk)."""
+    model = hist_result.get("_model")
+    if model:
+        return model.predict(_nb_features_from_row(row))
+    return 0, 0.0
+
+
+def train_plaintext_histogram_bc(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    alpha: float = 1.0,
+    threshold: float | None = None,
+    use_feature_weights: bool = True,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from local plaintext marginal counts."""
+    start = time.time()
+    raw_results = build_bc_raw_results_local(df, feature_values)
+    n_cancer = int(df["cancer_5yr"].astype(int).sum())
+    n_no_cancer = len(df) - n_cancer
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=n_cancer,
+        n_neg=n_no_cancer,
+        feature_values=_bc_histogram_feature_values(feature_values),
+    )
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "n_cancer": n_cancer,
+        "n_no_cancer": n_no_cancer,
+        "n_total": n_cancer + n_no_cancer,
+        "train_time": time.time() - start,
+    }
+
+
+def bc_plaintext_histogram_predict_proba(hist_result: dict, df_test: pd.DataFrame) -> list[float]:
+    """Predict plaintext HistogramClassifierModel P(cancer) for BC rows."""
+    model = hist_result.get("_model")
+    if not model:
+        return [0.0 for _ in range(len(df_test))]
+    return [float(model.predict(_nb_features_from_row(row.to_dict()))[1]) for _, row in df_test.iterrows()]
+
+
 def train_plaintext_bc_lr(df, feature_values: dict[str, list[str]]) -> dict[str, Any]:
     """Train a sklearn LogisticRegression on the same one-hot features."""
     from sklearn.linear_model import LogisticRegression
@@ -692,7 +1906,7 @@ def plaintext_predict_proba(model, col_names, df, feature_values, encoding="lr")
             if c not in X_encoded.columns:
                 X_encoded[c] = 0
         X_encoded = X_encoded[col_names]
-        return model.predict_proba(X_encoded.values)[:, 1]
+        return model.predict_proba(X_encoded)[:, 1]
     X, _ = _bc_one_hot_encode(df, feature_values)
     return model.predict_proba(X)[:, 1]
 
@@ -775,8 +1989,6 @@ def bc_naive_bayes_risk(P_cancer: float, P_no_cancer: float, P: dict, row: dict)
 # CMS cell suppression policy: counts 1-10 replaced with independence estimates
 # Reference: https://resdac.org/node/1506
 # ============================================================================
-
-CMS_MIN_CELL_SIZE = 11
 
 _LR_FEATURES_ORDERED = [
     "age_group",
@@ -984,6 +2196,119 @@ def build_linear_model(
     }
 
 
+def run_encrypted_lr_bc_ols(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    bi_raw: dict[str, Any] | None = None,
+    raw_results: list[tuple] | None = None,
+    n_cancer: int | None = None,
+    n_no_cancer: int | None = None,
+    min_cell_size: int = CMS_MIN_CELL_SIZE,
+    ridge_lambda: float = 0.01,
+) -> dict[str, Any]:
+    """Train BC LR as aggregate OLS/ridge from BI counts only.
+
+    The encrypted path never uses local rows: NB marginals provide ``X'y`` and
+    BI pairwise cross-tabs provide ``X'X``. Small positive pairwise cells are
+    replaced by independence estimates in ``run_bc_pairwise_queries``.
+    """
+    if client is None or not org or not dataset or not schema:
+        raise ValueError("run_encrypted_lr_bc_ols requires BI client/org/dataset/schema.")
+    if not feature_values:
+        raise ValueError("run_encrypted_lr_bc_ols requires feature_values.")
+
+    start = time.time()
+    base_rate_queries = 0
+    raw_source = "provided"
+    bi_raw = bi_raw or {}
+
+    if raw_results is None:
+        raw_results = bi_raw.get("raw_results")
+        raw_source = "bi_raw" if raw_results is not None else "rerun"
+
+    if n_cancer is None:
+        n_cancer = bi_raw.get("n_cancer")
+    if n_no_cancer is None:
+        n_no_cancer = bi_raw.get("n_no_cancer")
+
+    marginal_queries = 0
+    if raw_results is None:
+        rerun = run_bc_conditional_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            include_base_rates=n_cancer is None or n_no_cancer is None,
+            min_cell_size=min_cell_size,
+        )
+        raw_results = rerun["raw_results"]
+        marginal_queries = int(rerun.get("enc_queries", 0))
+        if n_cancer is None:
+            n_cancer = rerun.get("n_cancer")
+        if n_no_cancer is None:
+            n_no_cancer = rerun.get("n_no_cancer")
+        raw_source = "rerun"
+
+    if n_cancer is None or n_no_cancer is None or int(n_cancer) + int(n_no_cancer) == 0:
+        n_cancer, n_no_cancer = get_bc_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    n_cancer = int(n_cancer)
+    n_no_cancer = int(n_no_cancer)
+    n_total = n_cancer + n_no_cancer
+    if n_total == 0:
+        raise ValueError("run_encrypted_lr_bc_ols requires non-zero BI base rates.")
+
+    pairwise = run_bc_pairwise_queries(
+        client,
+        org,
+        dataset,
+        schema,
+        feature_values,
+        raw_results,
+        n_total,
+        min_cell_size=min_cell_size,
+    )
+    lr_model = build_linear_model(
+        raw_results,
+        pairwise,
+        feature_values,
+        n_cancer,
+        n_no_cancer,
+        ridge_lambda=ridge_lambda,
+    )
+
+    train_time = time.time() - start
+    return {
+        **lr_model,
+        "counts_from_bi": True,
+        "pairwise_from_bi": True,
+        "raw_results": raw_results,
+        "raw_results_source": raw_source,
+        "pairwise": pairwise["pairwise"],
+        "pairwise_data": pairwise,
+        "enc_queries": marginal_queries + base_rate_queries + int(pairwise.get("n_queries", 0)),
+        "marginal_queries": marginal_queries,
+        "base_rate_queries": base_rate_queries,
+        "pairwise_queries": int(pairwise.get("n_queries", 0)),
+        "n_cancer": n_cancer,
+        "n_no_cancer": n_no_cancer,
+        "n_total": n_total,
+        "n_suppressed": int(pairwise.get("n_suppressed", 0)),
+        "suppressed_cells": list(pairwise.get("suppressed_cells", [])),
+        "min_cell_size": min_cell_size,
+        "suppression_policy": (
+            "none" if min_cell_size <= 1 else f"cms_k{min_cell_size}_pairwise_independence_estimate"
+        ),
+        "ridge_lambda": ridge_lambda,
+        "train_time": train_time,
+    }
+
+
 def linear_model_predict(
     beta: np.ndarray,
     dummy_index: list[tuple[str, str]],
@@ -995,6 +2320,20 @@ def linear_model_predict(
     lr.beta = beta
     lr.dummy_index = list(dummy_index)
     return lr.predict(_nb_features_from_row(row), use_sigmoid=use_sigmoid)
+
+
+def bc_lr_predict(lr_result: dict, row: dict, use_sigmoid: bool = True) -> tuple[int, float]:
+    """Predict with an aggregate OLS/ridge BC LR result. Returns (pred, risk)."""
+    model = lr_result.get("_model")
+    if model:
+        risk = float(model.predict(_nb_features_from_row(row), use_sigmoid=use_sigmoid))
+    else:
+        beta = lr_result.get("beta")
+        dummy_index = lr_result.get("dummy_index", [])
+        if beta is None:
+            return 0, 0.0
+        risk = float(linear_model_predict(beta, dummy_index, row, use_sigmoid=use_sigmoid))
+    return (1 if risk >= 0.5 else 0), max(0.0, min(1.0, risk))
 
 
 def refine_bc_with_irls(
@@ -1060,10 +2399,10 @@ def get_bc_demo_config() -> dict[str, Any]:
     """Centralized notebook config for the breast-cancer demo."""
     return {
         "dataset": "breast-cancer-screening-data",
-        "schema": "train",
-        "test_schema": "test",
-        "sqlite_db": "demo_data/plaintext/bc_train.db",
-        "test_sqlite_db": "demo_data/plaintext/bc_test.db",
+        "schema": "bc-train",
+        "test_schema": "bc-test",
+        "sqlite_db": "../demo-datasets/datasets/breast-cancer/sqlite/bc_train_270k.db",
+        "test_sqlite_db": "../demo-datasets/datasets/breast-cancer/sqlite/bc_test.db",
         "nb_features": [
             "age_group",
             "race_ethnicity",
@@ -1197,6 +2536,198 @@ def evaluate_probabilities(
     """Evaluate probability outputs against binary labels at a threshold."""
     preds = [1 if p >= threshold else 0 for p in probs]
     return metrics_from_binary_preds(preds, y_true)
+
+
+def compute_bc_metrics(
+    y_true,
+    scores,
+    threshold: float = 0.0167,
+    cohort_prev: float | None = None,
+    pop_rate: float = 0.016,
+) -> dict[str, Any]:
+    """Evaluate breast-cancer risk scores with fraud-style ranking metrics.
+
+    ``scores`` should be probabilities on the prior used for thresholding. If
+    ``cohort_prev`` is provided, an additional F1@best metric is computed after
+    prior-shift recalibration to ``pop_rate``.
+    """
+    from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+
+    y_true_arr = np.asarray(y_true, dtype=int)
+    scores_arr = np.asarray(scores, dtype=float)
+    n = len(y_true_arr)
+    if cohort_prev is None:
+        cohort_prev = float(y_true_arr.mean()) if n else 0.5
+
+    preds = (scores_arr >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_true_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_true_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_true_arr == 1)).sum())
+    tn = int(((preds == 0) & (y_true_arr == 0)).sum())
+    base = screening_metrics(tp, fp, tn, fn)
+    acc = (tp + tn) / max(1, n)
+
+    if len(np.unique(y_true_arr)) < 2:
+        roc_auc = float("nan")
+        pr_auc = float("nan")
+        f1_best = float("nan")
+        f1_pop_best = float("nan")
+    else:
+        roc_auc = float(roc_auc_score(y_true_arr, scores_arr))
+        pr_auc = float(average_precision_score(y_true_arr, scores_arr))
+        precisions, recalls, _ = precision_recall_curve(y_true_arr, scores_arr)
+        f1_curve = 2 * precisions * recalls / np.maximum(precisions + recalls, 1e-12)
+        f1_best = float(np.nanmax(f1_curve))
+
+        pop_scores = np.array([recalibrate_risk(float(s), cohort_prev, pop_rate) for s in scores_arr])
+        prec_p, rec_p, _ = precision_recall_curve(y_true_arr, pop_scores)
+        f1_pop_curve = 2 * prec_p * rec_p / np.maximum(prec_p + rec_p, 1e-12)
+        f1_pop_best = float(np.nanmax(f1_pop_curve))
+
+    return {
+        **base,
+        "acc": acc,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "f1_best": f1_best,
+        "f1_pop_best": f1_pop_best,
+        "cohort_prev": cohort_prev,
+        "pop_rate": pop_rate,
+        "threshold": threshold,
+    }
+
+
+def _bc_metric_value(value: float, pct: bool = False) -> str:
+    if value != value:
+        return "-"
+    if pct:
+        return f"{value * 100:.1f}%"
+    return f"{value:.3f}"
+
+
+def _bc_metric_delta(enc: float, plain: float, higher_better: bool = True, scale: float = 1.0) -> str:
+    if enc != enc or plain != plain:
+        return "<td class='number-cell'>-</td>"
+    delta = (enc - plain) * scale
+    cls = "status-good" if (delta >= 0) == higher_better else "status-bad"
+    if scale == 100:
+        return f"<td class='{cls}'>{delta:+.1f}pp</td>"
+    return f"<td class='{cls}'>{delta:+.3f}</td>"
+
+
+def bc_model_summary_table(
+    model_name: str,
+    enc_metrics: dict[str, Any],
+    plain_metrics: dict[str, Any],
+    enc_train_time: float,
+    plain_train_time: float,
+    enc_queries: int = 0,
+    plain_label: str = "sklearn",
+) -> str:
+    """Build a fraud-style comparison table for one breast-cancer model."""
+    threshold_pct = enc_metrics.get("threshold", 0.0167) * 100
+    pop_pct = enc_metrics.get("pop_rate", 0.016) * 100
+
+    def _row(label: str, key: str, pct: bool = False) -> str:
+        enc_val = enc_metrics.get(key, float("nan"))
+        plain_val = plain_metrics.get(key, float("nan"))
+        return (
+            f"<tr class='data-row'><td class='label-cell'>{label}</td>"
+            f"<td class='number-cell'>{_bc_metric_value(plain_val, pct=pct)}</td>"
+            f"<td class='number-cell'>{_bc_metric_value(enc_val, pct=pct)}</td>"
+            f"{_bc_metric_delta(enc_val, plain_val, scale=100 if pct else 1.0)}</tr>"
+        )
+
+    return f"""<table class="bi-metrics-table">
+<caption style="caption-side:top;text-align:left;font-weight:600;padding-bottom:4px;">{model_name}</caption>
+<tr class="header-row"><th></th><th>{plain_label}</th><th>Blind Insight</th><th>Delta</th></tr>
+{_row(f"F1 @{threshold_pct:.2f}% risk", "f1")}
+{_row("F1@best", "f1_best")}
+{_row("ROC-AUC", "roc_auc")}
+{_row("PR-AUC", "pr_auc")}
+{_row(f"F1@best @ {pop_pct:.1f}% pop prior", "f1_pop_best")}
+{_row("Sensitivity", "sens", pct=True)}
+{_row("Specificity", "spec", pct=True)}
+{_row("PPV (precision)", "ppv", pct=True)}
+{_row("Flagged High-Risk", "flagged", pct=True)}
+{_row("Accuracy", "acc", pct=True)}
+<tr class='data-row'><td class='label-cell'>BI Queries</td>
+    <td class='number-cell'>0</td>
+    <td class='number-cell'>{enc_queries}</td>
+    <td class='number-cell'>-</td></tr>
+<tr class='data-row'><td class='label-cell'>Train Time</td>
+    <td class='number-cell'>{plain_train_time * 1000:.0f}ms</td>
+    <td class='number-cell'>{enc_train_time:.1f}s</td>
+    <td class='number-cell'>+{enc_train_time - plain_train_time:.1f}s</td></tr>
+<tr class='data-row'><td class='label-cell'>Data Decrypted</td>
+    <td class='string-cell status-bad'>YES</td>
+    <td class='string-cell status-good'>NEVER</td>
+    <td class='number-cell'>-</td></tr>
+</table>"""
+
+
+def bc_confusion_matrix_html(
+    label: str,
+    enc_metrics: dict[str, Any],
+    plain_metrics: dict[str, Any],
+) -> str:
+    """Build side-by-side confusion matrices for a breast-cancer model."""
+
+    def _cm_table(metrics, subtitle):
+        err = "background:#ffebee;color:#4a2d6b;"
+        return (
+            f'<div><p style="font-size:11px;font-weight:600;margin-bottom:2px;">{subtitle}</p>'
+            f'<table class="bi-metrics-table" style="max-width:240px;font-size:12px;">'
+            f"<tr><td></td><th>Pred Low</th><th>Pred High</th></tr>"
+            f"<tr><th>Actual No</th>"
+            f'<td class="number-cell">{metrics["tn"]:,}</td>'
+            f'<td class="number-cell" style="{err}">{metrics["fp"]:,}</td></tr>'
+            f"<tr><th>Actual Yes</th>"
+            f'<td class="number-cell" style="{err}">{metrics["fn"]:,}</td>'
+            f'<td class="number-cell">{metrics["tp"]:,}</td></tr>'
+            f"</table></div>"
+        )
+
+    return (
+        f'<div style="margin-bottom:16px;">'
+        f'<h4 style="font-size:14px;margin-bottom:4px;">{label}</h4>'
+        f'<div style="display:flex;gap:24px;flex-wrap:wrap;">'
+        f"{_cm_table(enc_metrics, 'Encrypted (Blind Insight)')}"
+        f"{_cm_table(plain_metrics, 'Plaintext benchmark')}"
+        f"</div></div>"
+    )
+
+
+def bc_eight_model_table(models: list[dict[str, Any]]) -> str:
+    """Build a multi-model BC comparison table matching the fraud notebook."""
+    header = "<tr class='header-row'><th>Metric</th>"
+    for model in models:
+        header += f"<th>{model['name']}</th>"
+    header += "</tr>"
+
+    def _row(label: str, key: str, pct: bool = False) -> str:
+        cells = f"<td class='label-cell'>{label}</td>"
+        for model in models:
+            metrics = model.get("enc_metrics", model)
+            cells += f"<td class='number-cell'>{_bc_metric_value(metrics.get(key, float('nan')), pct=pct)}</td>"
+        return f"<tr class='data-row'>{cells}</tr>"
+
+    rows = "\n".join(
+        [
+            _row("F1 @1.67%", "f1"),
+            _row("F1@best", "f1_best"),
+            _row("ROC-AUC", "roc_auc"),
+            _row("PR-AUC", "pr_auc"),
+            _row("Sensitivity", "sens", pct=True),
+            _row("Specificity", "spec", pct=True),
+            _row("PPV", "ppv", pct=True),
+            _row("Flagged High-Risk", "flagged", pct=True),
+        ]
+    )
+    return f"""<table class="bi-metrics-table">
+{header}
+{rows}
+</table>"""
 
 
 def evaluate_bc_dt_nb_models(
@@ -1521,7 +3052,7 @@ def build_three_model_rows(
             "decrypted": "NEVER",
         },
         {
-            "name": "Logistic Reg (OLS+IRLS)",
+            "name": "Logistic Reg (OLS/ridge)",
             "f1": lr_metrics["f1"],
             "sens": lr_metrics["sens"],
             "spec": lr_metrics["spec"],
@@ -1652,7 +3183,7 @@ def run_bc_full_validation(
     use_sigmoid: bool = False,
     **_kwargs,
 ) -> dict[str, Any]:
-    """Validate all three models (NB, DT, LR): encrypted vs sklearn plaintext.
+    """Validate representative models (NB, DT, LR): encrypted vs sklearn plaintext.
 
     Plaintext comparisons use real-world sklearn models (CART, LogisticRegression)
     as the benchmark a data scientist would actually use.
@@ -1814,7 +3345,7 @@ def run_bc_full_validation(
     cm_html = (
         _cm("Naive Bayes", nb_enc_m, nb_pln_m)
         + _cm("Decision Tree (Gini)", dt_enc_m, dt_pln_m)
-        + _cm("Logistic Regression (OLS+IRLS)", lr_enc_m, lr_pln_m)
+        + _cm("Logistic Regression (OLS/ridge)", lr_enc_m, lr_pln_m)
     )
     cm_html += (
         f'<p style="font-size:11px;color:#718096;margin-top:8px;">'

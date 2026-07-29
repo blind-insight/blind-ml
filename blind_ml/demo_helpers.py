@@ -888,7 +888,7 @@ def run_bi_training(
     n_high_local: int | None = None,
     n_low_local: int | None = None,
     batch_profile: str = "three_even",
-    max_workers: int = 30,
+    max_workers: int = 48,
 ) -> dict[str, object]:
     """Train Naive Bayes using encrypted aggregate queries only.
 
@@ -900,9 +900,10 @@ def run_bi_training(
     check — a large divergence indicates the mirror is out of sync with the
     encrypted dataset.
 
-    Uses ``max_workers`` threads spread across 3 balanced batches.
-    Default 30 workers is tuned for a local BI server; callers targeting
-    the hosted cloud instance should pass ``max_workers=10``.
+    Uses a single ``max_workers``-wide thread pool over all queries. Default 48
+    is tuned for a local BI server (see the concurrency sweep: throughput
+    plateaus ~24-48 workers); callers targeting a constrained/hosted instance
+    should lower ``max_workers`` (e.g. 10).
     """
     # Class priors from BI — this is the encrypted-data source of truth.
     n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
@@ -944,31 +945,14 @@ def run_bi_training(
             )
 
     queries = _bi_queries(values)
-    results: list[tuple] = []
-    enc_queries = 0
 
     def run_query(q):
         f_type, r_class, val, q_str = q
         count = get_encrypted_count(client, org, dataset, schema, q_str)
         return (f_type, r_class, val, count)
 
-    n_queries = len(queries)
-    n_batches = 3 if n_queries >= 3 else 1
-    base = n_queries // n_batches
-    remainder = n_queries % n_batches
-    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
-
-    offset = 0
-    for batch_idx, planned_size in enumerate(batch_plan, start=1):
-        if offset >= len(queries):
-            break
-        batch = queries[offset : offset + planned_size]
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(run_query, q) for q in batch]
-            batch_results = [f.result() for f in futures]
-            results.extend(batch_results)
-            enc_queries += len(batch_results)
-        offset += planned_size
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(run_query, queries))
 
     model = build_bi_model(results, values, n_high, n_low)
     model["raw_results"] = results
@@ -1815,7 +1799,7 @@ def run_encrypted_dt_fraud(
     max_depth: int = 3,
     k_min: int = 0,
     criterion: str = "gini",
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Build a fraud decision tree entirely from encrypted aggregate counts."""
     if not feature_values:
@@ -1861,6 +1845,7 @@ def run_encrypted_dt_fraud(
         feature_values=dt_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
     )
     if dt.tree is not None:
         dt.tree["bi_counts"] = True
@@ -1989,7 +1974,7 @@ def _run_fraud_marginal_queries(
     dataset: str,
     schema: str,
     feature_values: dict[str, list[str]],
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> list[tuple]:
     """Fetch fraud class-split marginal counts from BI."""
     queries = _bi_queries(feature_values)
@@ -2019,7 +2004,7 @@ def run_encrypted_rf_fraud(
     org: str | None = None,
     dataset: str | None = None,
     schema: str | None = None,
-    max_workers: int = 10,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train a fraud Random Forest from encrypted aggregate counts.
 
@@ -2086,6 +2071,7 @@ def run_encrypted_rf_fraud(
         feature_values=rf_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
     )
 
     additional_rf_queries = query_count()
@@ -2206,7 +2192,8 @@ def run_encrypted_adaboost_fraud(
     org: str | None = None,
     dataset: str | None = None,
     schema: str | None = None,
-    max_workers: int = 10,
+    max_workers: int = 48,
+    max_regions: int | None = None,
 ) -> dict[str, Any]:
     """Train fraud AdaBoost stumps from encrypted aggregate counts.
 
@@ -2278,6 +2265,8 @@ def run_encrypted_adaboost_fraud(
         feature_values=boost_feature_values,
         n_pos=n_high,
         n_neg=n_low,
+        max_workers=max_workers,
+        max_regions=max_regions,
     )
 
     additional_adaboost_queries = query_count()
@@ -2638,7 +2627,7 @@ def run_encrypted_gnb_fraud(
     n_low: int | None = None,
     var_smoothing: float = 1e-9,
     threshold: float = 0.5,
-    max_workers: int = 30,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train GaussianNaiveBayesModel from encrypted value-count queries."""
     start = time.time()
@@ -2656,19 +2645,8 @@ def run_encrypted_gnb_fraud(
         count = get_encrypted_count(client, org, dataset, schema, query)
         return (feature, class_label, value, count)
 
-    n_batches = 3 if len(queries) >= 3 else 1
-    base = len(queries) // n_batches
-    remainder = len(queries) % n_batches
-    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
-
-    offset = 0
-    for planned_size in batch_plan:
-        batch = queries[offset : offset + planned_size]
-        if not batch:
-            break
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            raw_results.extend(executor.map(run_query, batch))
-        offset += planned_size
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(run_query, queries))
 
     sufficient_stats = _fraud_gnb_sufficient_stats(raw_results)
     model = _GaussianNaiveBayesModel(
@@ -2827,7 +2805,7 @@ def run_encrypted_bn_fraud(
     n_low: int | None = None,
     alpha: float = 1.0,
     threshold: float = 0.5,
-    max_workers: int = 30,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train BayesianNetworkClassifierModel from encrypted CPT count queries."""
     start = time.time()
@@ -2845,19 +2823,8 @@ def run_encrypted_bn_fraud(
         count = get_encrypted_count(client, org, dataset, schema, query)
         return (feature, class_label, parent_state, value, count)
 
-    n_batches = 3 if len(queries) >= 3 else 1
-    base = len(queries) // n_batches
-    remainder = len(queries) % n_batches
-    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
-
-    offset = 0
-    for planned_size in batch_plan:
-        batch = queries[offset : offset + planned_size]
-        if not batch:
-            break
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            raw_results.extend(executor.map(run_query, batch))
-        offset += planned_size
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(run_query, queries))
 
     model = _BayesianNetworkClassifierModel(
         parent_map=resolved_parent_map,
@@ -2988,7 +2955,7 @@ def run_encrypted_histogram_fraud(
     alpha: float = 1.0,
     threshold: float | None = None,
     use_feature_weights: bool = True,
-    max_workers: int = 30,
+    max_workers: int = 48,
 ) -> dict[str, Any]:
     """Train HistogramClassifierModel from encrypted aggregate queries.
 
@@ -3009,19 +2976,8 @@ def run_encrypted_histogram_fraud(
         count = get_encrypted_count(client, org, dataset, schema, q_str)
         return (f_type, r_class, val, count)
 
-    n_batches = 3 if len(queries) >= 3 else 1
-    base = len(queries) // n_batches
-    remainder = len(queries) % n_batches
-    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
-
-    offset = 0
-    for planned_size in batch_plan:
-        batch = queries[offset : offset + planned_size]
-        if not batch:
-            break
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            raw_results.extend(executor.map(run_query, batch))
-        offset += planned_size
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(run_query, queries))
 
     model = _HistogramClassifierModel(
         alpha=alpha,

@@ -225,6 +225,7 @@ __marimo__/
 
 # Environment variables (contains BI credentials)
 .env
+*.env
 
 # Blind Proxy binary — download from https://docs.blindinsight.io
 blind
@@ -254,3 +255,9 @@ demo_data/upload_batches/*
 # Local smoketest / scratch (scripts/smoke_test.py is tracked; its venv is not)
 .venv-smoke/
 venv-smoke/
+
+# Test cases
+tests/
+
+# Claude
+Claude.md

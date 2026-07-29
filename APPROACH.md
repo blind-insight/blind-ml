@@ -273,7 +273,7 @@ where `w_j` reflects feature discrimination (optional; enabled in the fraud demo
 high_risk_count = query("risk_level:count(50~100)")  # Returns: 1,440
 
 # Ask Blind Insight: How many low-risk accounts?
-low_risk_count = query("risk_level:count(0~49)")    # Returns: 1,013
+low_risk_count = query("risk_level:count(0~49)")  # Returns: 1,013
 ```
 
 These are **aggregate queries** - BI computes the count on its encrypted index and returns just the number. No records are returned. No data is decrypted.
@@ -285,14 +285,14 @@ These are **aggregate queries** - BI computes the count on its encrypted index a
 mule_high = query("risk_level:count(50~100),fraud_type:mule_account")  # Returns: 354
 
 # How many low-risk accounts have fraud_type = "mule_account"?
-mule_low = query("risk_level:count(0~49),fraud_type:mule_account")    # Returns: 56
+mule_low = query("risk_level:count(0~49),fraud_type:mule_account")  # Returns: 56
 ```
 
 ### Step 3: Calculate Probabilities
 
 ```python
 P_mule_given_high = mule_high / high_risk_count  # 354/1440 = 0.246
-P_mule_given_low = mule_low / low_risk_count     # 56/1013 = 0.055
+P_mule_given_low = mule_low / low_risk_count  # 56/1013 = 0.055
 ```
 
 **Insight:** Mule accounts are 4.5x more likely to be high-risk.
@@ -329,10 +329,10 @@ beta = solve(XtX, Xty)  # then refine with Newton-Raphson iterations
 ```python
 def predict(account):
     # Any trained model can classify — pick one or ensemble them
-    nb_score = naive_bayes_predict(account)    # probability-based
+    nb_score = naive_bayes_predict(account)  # probability-based
     dt_score = decision_tree_predict(account)  # rule-based
     lr_score = logistic_regression_predict(account)  # linear boundary
-    
+
     return "HIGH RISK" if score > threshold else "LOW RISK"
 ```
 

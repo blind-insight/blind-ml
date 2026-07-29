@@ -145,6 +145,7 @@ class BlindInsightClient:
         proxy_url: str = "https://local.blindinsight.io",
         proxy_auth: tuple | None = None,
         verify_ssl: bool = True,
+        pool_maxsize: int = 64,
     ):
         """
         Initialize the Blind Insight client (proxy HTTP API).
@@ -156,10 +157,23 @@ class BlindInsightClient:
                 each request separately from ``./blind login``.
             verify_ssl: Whether to verify SSL certificates (default: True).
                 Set to False for local dev with self-signed certs.
+            pool_maxsize: Max simultaneous HTTP connections per host. Defaults to 64.
+                requests.Session's own default is only 10, which silently caps any
+                ThreadPoolExecutor concurrency above 10 (the extra workers just wait
+                on connections). Set this >= your largest ``max_workers`` so the
+                worker count is real. Concurrency benchmarks put the useful range at
+                ~24-48 workers before the server plateaus.
         """
         self.proxy_url = proxy_url.rstrip("/")
         self.session = requests.Session()
         self.session.verify = verify_ssl
+        # Enlarge the connection pool so concurrent query workers aren't throttled
+        # to the 10-connection default (see pool_maxsize docstring above).
+        from requests.adapters import HTTPAdapter
+
+        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.profiling = profiling  # Use global profiling instance
 
         if proxy_auth:
