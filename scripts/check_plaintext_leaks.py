@@ -194,6 +194,21 @@ def check_models(paths: list[Path] | None = None) -> list[str]:
     return violations
 
 
+def _body_forbidden(node: ast.FunctionDef, source_lines: list[str]) -> list[str]:
+    """Return ENCRYPTED_BODY_FORBIDDEN patterns found in a function body."""
+    body_text = _body_source(node, source_lines)
+    return [ind for ind in ENCRYPTED_BODY_FORBIDDEN if ind in body_text]
+
+
+def _call_targets(node: ast.FunctionDef) -> list[str]:
+    """Return names of bare function calls (not method calls) in a function body."""
+    names: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+            names.append(child.func.id)
+    return names
+
+
 def check_functions(paths: list[Path] | None = None) -> list[str]:
     """Guardrail 2: scan encrypted functions for plaintext training references."""
     violations: list[str] = []
@@ -208,23 +223,30 @@ def check_functions(paths: list[Path] | None = None) -> list[str]:
         tree = ast.parse(source, filename=str(fpath))
         rel = fpath.relative_to(REPO_ROOT)
 
+        all_funcs: dict[str, ast.FunctionDef] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                all_funcs[node.name] = node
+
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if not _is_encrypted_function(node.name):
                 continue
 
-            # Check two ways: forbidden parameter names, and forbidden patterns in the body.
             reasons: list[str] = []
 
             bad_params = [arg.arg for arg in node.args.args if arg.arg in ENCRYPTED_PARAM_FORBIDDEN]
             if bad_params:
                 reasons.append(f"param {', '.join(bad_params)}")
 
-            body_text = _body_source(node, source_lines)
-            for indicator in ENCRYPTED_BODY_FORBIDDEN:
-                if indicator in body_text:
-                    reasons.append(indicator)
+            reasons.extend(_body_forbidden(node, source_lines))
+
+            for callee_name in _call_targets(node):
+                if callee_name in all_funcs and not _is_encrypted_function(callee_name):
+                    callee_hits = _body_forbidden(all_funcs[callee_name], source_lines)
+                    for hit in callee_hits:
+                        reasons.append(f"{hit} (via {callee_name})")
 
             if reasons:
                 detail = "; ".join(reasons)

@@ -328,3 +328,107 @@ class TestGuardrail2:
         """)
         violations = check_functions([path])
         assert len(violations) == 1
+
+
+# ---------------------------------------------------------------------------
+# Guardrail 2.5 — call-graph tracing (delegation detection)
+# ---------------------------------------------------------------------------
+
+
+class TestGuardrail25:
+    def test_delegation_sklearn_caught(self):
+        """Encrypted function delegates to helper that imports sklearn — must be caught."""
+        path = _write_tmp("""\
+            def _build_fraud_nn(data, target):
+                from sklearn.neural_network import MLPClassifier
+                model = MLPClassifier(hidden_layer_sizes=(100, 100))
+                model.fit(data, target)
+                return model
+
+            def run_encrypted_nn_fraud(client, org, dataset, schema):
+                data = client.get_data()
+                target = client.get_labels()
+                model = _build_fraud_nn(data, target)
+                return {"_model": model}
+        """)
+        violations = check_functions([path])
+        assert len(violations) == 1
+        assert "run_encrypted_nn_fraud" in violations[0]
+        assert "_build_fraud_nn" in violations[0]
+
+    def test_delegation_read_csv_caught(self):
+        """Encrypted function delegates to helper that loads CSV — must be caught."""
+        path = _write_tmp("""\
+            def _load_training(path):
+                import pandas as pd
+                return pd.read_csv(path)
+
+            def run_encrypted_train(client, org):
+                df = _load_training("data.csv")
+                return {"data": df}
+        """)
+        violations = check_functions([path])
+        assert len(violations) == 1
+        assert "run_encrypted_train" in violations[0]
+        assert "_load_training" in violations[0]
+
+    def test_delegation_clean_helper_not_flagged(self):
+        """Encrypted function calls a clean helper — must NOT be flagged."""
+        path = _write_tmp("""\
+            def _build_count_provider(client, org, dataset, schema):
+                counts = client.query_counts(org, dataset, schema)
+                return counts
+
+            def run_encrypted_dt_fraud(client, org, dataset, schema):
+                count_fn = _build_count_provider(client, org, dataset, schema)
+                dt = DecisionTreeModel()
+                dt.fit_from_counts(count_fn=count_fn)
+                return {"_model": dt}
+        """)
+        violations = check_functions([path])
+        assert violations == []
+
+    def test_delegation_multiple_helpers_one_dirty(self):
+        """Encrypted function calls two helpers, one dirty — must catch the dirty one."""
+        path = _write_tmp("""\
+            def _get_counts(client, org):
+                return client.query_counts(org)
+
+            def _sneak_sklearn(data):
+                from sklearn.ensemble import RandomForestClassifier
+                return RandomForestClassifier().fit(data, data)
+
+            def run_encrypted_combo(client, org, data):
+                counts = _get_counts(client, org)
+                model = _sneak_sklearn(counts)
+                return {"_model": model}
+        """)
+        violations = check_functions([path])
+        assert len(violations) >= 1
+        assert "_sneak_sklearn" in violations[0]
+
+    def test_delegation_method_call_not_followed(self):
+        """obj.method() calls are not followed — only bare function calls."""
+        path = _write_tmp("""\
+            class Loader:
+                def load(self):
+                    from sklearn.ensemble import RandomForestClassifier
+                    return RandomForestClassifier()
+
+            def run_encrypted_test(client):
+                loader = Loader()
+                model = loader.load()
+                return {"_model": model}
+        """)
+        violations = check_functions([path])
+        assert violations == []
+
+    def test_helper_not_in_file_ignored(self):
+        """Calls to functions not defined in the same file are not followed."""
+        path = _write_tmp("""\
+            def run_encrypted_external(client, org):
+                result = some_imported_function(client, org)
+                return {"result": result}
+        """)
+        violations = check_functions([path])
+        assert violations == []
