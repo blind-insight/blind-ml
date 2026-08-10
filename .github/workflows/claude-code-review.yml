@@ -1,0 +1,81 @@
+name: Claude Plaintext Leak Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    paths:
+      - "blind_ml/**/*.py"
+      - "scripts/**/*.py"
+      - "tests/**/*.py"
+      - "*.py"
+
+jobs:
+  claude-plaintext-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude Plaintext Leak Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are a security reviewer for blind-ml, a machine learning library
+            that trains models on **encrypted aggregate counts** from Blind Insight (BI).
+            The core security invariant is:
+
+            **Models in this library must NEVER train on raw/plaintext data rows.**
+            They receive aggregate counts (marginals, conditionals, pairwise counts)
+            from Blind Insight's encrypted API — never DataFrames, CSVs, SQL queries,
+            or sklearn fit calls on local data.
+
+            Review the diff of this PR for any violation of this invariant. Specifically:
+
+            1. **Model fit methods**: Any `fit*` method on a model class that accepts
+               a DataFrame, calls sklearn, uses `read_csv`/`read_sql`/`read_parquet`,
+               or operates on raw data arrays (`X`, `y`, `features`, `labels`) is a
+               violation. Fit methods should receive pre-computed aggregate counts from BI.
+               Exception: `refine_irls` is an IRLS weight-refinement step, not primary
+               model training.
+
+            2. **Encrypted code paths**: Functions prefixed with `run_encrypted_`,
+               `run_bi_`, `get_encrypted_`, `get_bi_`, or named `run_bc_training`,
+               `run_bc_conditional_queries`, `run_bc_pairwise_queries`, `get_bc_base_rates`
+               are in the "encrypted zone." They must query BI for aggregate data — never
+               load local files, import sklearn, accept raw data parameters, or call
+               plaintext training functions.
+               Exceptions: validation functions (`run_test_validation`,
+               `run_bc_test_validation`, `run_bc_full_validation`) and demo functions
+               (`run_realtime_demo`, `run_bc_realtime_demo`) may use plaintext for
+               comparison/display purposes.
+
+            3. **Indirect delegation**: Watch for encrypted functions that call helper
+               functions which themselves load data or use sklearn — even if the
+               encrypted function's own body looks clean.
+
+            4. **New patterns the deterministic scanner might miss**: Variable names
+               not in the standard forbidden list (e.g. `data`, `samples`, `input_matrix`,
+               `training_set`, `dataset`), novel data-loading approaches, or any other
+               creative way plaintext data could enter an encrypted code path.
+
+            Be concise. For each violation, report one line:
+              file:line — what the violation is and why it breaks the invariant.
+
+            Example:
+              blind_ml/models.py:142 — MyModel.fit() accepts a DataFrame param; models must train on BI aggregate counts only.
+
+            If no violations are found, say "No plaintext leak violations found." and nothing else.
+
+            Only review for plaintext leak violations — do not review for general
+            code quality, style, or unrelated issues. Do not add preamble,
+            explanations, or suggestions beyond the violation list.
