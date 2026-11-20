@@ -264,7 +264,7 @@ BIOPSY_BINS = [
 _BC_STATIC_FEATURE_VALUES = {
     "age_groups": ["40_49", "50_59", "60_69", "70_74"],
     "race_values": ["asian_pi", "black", "hispanic", "other", "white"],
-    "relatives_values": ["0", "1", "2", "3", "4", "5"],
+    "relatives_values": ["0", "1", "2", "3", "4"],
     "biopsies_values": [b[0] for b in BIOPSY_BINS],
     "atypical_values": ["no", "unknown", "yes"],
     "menarche_values": ["12_13", "14_plus", "under_12"],
@@ -281,13 +281,19 @@ _BC_GNB_DEFAULT_FEATURES = [
     "breast_density",
 ]
 
+# Query domains run from the schema minimum up to, but NOT including, the
+# schema maximum (schemas/breast_cancer.json). The encrypted numeric index holds
+# values 0..maximum-1, so an equality filter on `maximum` wraps to 0 and returns
+# the value-0 count. Querying num_prior_biopsies:7 counted every zero-biopsy
+# patient, which skewed the encrypted GaussianNB means/variances away from
+# sklearn (4,600 vs 2,153 false positives). No record holds the maximum.
 _BC_GNB_VALUE_DOMAINS = {
-    "age": [str(v) for v in range(40, 77)],
-    "age_at_menarche": [str(v) for v in range(8, 20)],
-    "age_at_first_birth": [str(v) for v in range(0, 48)],
-    "num_first_degree_relatives": [str(v) for v in range(0, 6)],
-    "num_prior_biopsies": [str(v) for v in range(0, 8)],
-    "breast_density": [str(v) for v in range(1, 7)],
+    "age": [str(v) for v in range(40, 76)],
+    "age_at_menarche": [str(v) for v in range(8, 19)],
+    "age_at_first_birth": [str(v) for v in range(0, 47)],
+    "num_first_degree_relatives": [str(v) for v in range(0, 5)],
+    "num_prior_biopsies": [str(v) for v in range(0, 7)],
+    "breast_density": [str(v) for v in range(1, 6)],
 }
 
 
